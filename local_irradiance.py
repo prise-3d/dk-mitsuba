@@ -2,338 +2,185 @@ import drjit as dr
 import mitsuba as mi
 import numpy as np
 
+# Initialiser le variant par défaut si nécessaire
+if not mi.variant():
+    mi.set_variant('llvm_ad_rgb')
 
 class SurfaceIrradianceVolume:
-    """
-    Structure de données pour le 'Learning Light Transport'.
-    
-    Elle gère un ensemble de points discrets sur les surfaces (positions + normales).
-    À chaque point est attachée une hémisphère discrétisée (tableau 2D) stockant :
-    - La somme des récompenses (pour calculer Q)
-    - Le nombre de visites
-    """
-
     def __init__(self, positions, normals, resolution_u=8, resolution_v=8):
-        """
-        Initialise la structure.
-
-        :param positions: [N, 3] Array des positions des points sur la surface.
-        :param normals:   [N, 3] Array des normales associées.
-        :param resolution_u: Résolution azimutale (phi) de l'hémisphère.
-        :param resolution_v: Résolution zénithale (theta) de l'hémisphère.
-        """
         self.positions = mi.Point3f(positions)
         self.normals = mi.Vector3f(normals)
-        
-        # Dimensions
         self.n_points = dr.width(self.positions)
-        self.res_u = resolution_u
-        self.res_v = resolution_v
+        self.res_u, self.res_v = resolution_u, resolution_v
         self.n_bins_per_point = resolution_u * resolution_v
-        
-        # Stockage plat pour Dr.Jit (Structure of Arrays)
-        # Taille totale = n_points * n_bins_per_point
         total_size = self.n_points * self.n_bins_per_point
-        
-        # On stocke la somme des valeurs pour permettre des mises à jour atomiques faciles
-        # Q = sum_values / visit_counts
         self.sum_values = dr.zeros(mi.Float, total_size)
-        self.visit_counts = dr.zeros(mi.Float, total_size) # Float pour faciliter les divisions
-
-    def get_q_value(self, spatial_indices, directions):
-        """
-        Récupère la valeur Q (moyenne) pour des points spatiaux donnés et des directions données.
-        
-        :param spatial_indices: [k] Indices des points (int) dans le tableau self.positions.
-        :param directions:      [k, 3] Directions (monde) normalisées.
-        :return:                [k] Valeurs Q estimées.
-        """
-        # 1. Calculer l'index plat dans le tableau de données
-        bin_indices = self._get_bin_indices(spatial_indices, directions)
-        flat_indices = spatial_indices * self.n_bins_per_point + bin_indices
-        
-        # 2. Gather les données
-        total_value = dr.gather(mi.Float, self.sum_values, flat_indices)
-        count = dr.gather(mi.Float, self.visit_counts, flat_indices)
-        
-        # 3. Calculer Q (moyenne). Si count == 0, retourne 0.
-        return dr.select(count > 0, total_value / count, 0.0)
-
-    def update(self, spatial_indices, directions, rewards):
-        """
-        Met à jour les statistiques (accumule la récompense et incrémente le compteur).
-        Thread-safe via scatter_reduce (atomic add).
-
-        :param spatial_indices: [k] Indices des points concernés.
-        :param directions:      [k, 3] Directions incidentes (monde).
-        :param rewards:         [k] Valeur reçue (radiance/throughput).
-        """
-        # 1. Identifier les bins concernés
-        bin_indices = self._get_bin_indices(spatial_indices, directions)
-        flat_indices = spatial_indices * self.n_bins_per_point + bin_indices
-        
-        # 2. Accumulation atomique
-        dr.scatter_reduce(dr.ReduceOp.Add, self.sum_values, rewards, flat_indices)
-        dr.scatter_reduce(dr.ReduceOp.Add, self.visit_counts, 1.0, flat_indices)
+        self.visit_counts = dr.zeros(mi.Float, total_size)
 
     def _get_bin_indices(self, spatial_indices, directions):
-        """
-        Méthode interne : Transforme Direction Monde -> Index de Bin Local (u, v)
-        en utilisant la normale stockée pour chaque point spatial.
-        """
-        # Récupérer la normale associée à chaque point spatial
         n = dr.gather(mi.Vector3f, self.normals, spatial_indices)
-        
-        # Créer un repère local (Frame) à partir de la normale
-        frame = mi.Frame3f(n)
-        
-        # Convertir la direction monde en direction locale
-        w_local = frame.to_local(directions)
-        
-        # --- Projection Hémisphérique ---
-        # w_local.z est le cos(theta) par rapport à la normale.
-        # On suppose que les directions viennent du dessus (w_local.z > 0).
-        # Si w_local.z < 0 (sous la surface), on peut clamper ou ignorer.
-        
-        # Coordonnées sphériques
-        # Theta : angle avec la normale [0, pi/2] -> cos_theta [0, 1]
+        w_local = mi.Frame3f(n).to_local(directions)
         cos_theta = dr.maximum(0.0, dr.minimum(1.0, w_local.z))
-        
-        # Phi : angle azimutal [-pi, pi]
         phi = dr.atan2(w_local.y, w_local.x)
-        phi = dr.select(phi < 0, phi + 2 * dr.pi, phi) # Map [0, 2pi]
-        
-        # --- Binning ---
-        
-        # Mapping u (phi) : [0, 2pi] -> [0, res_u]
-        u_cont = (phi / (2 * dr.pi)) * self.res_u
-        u_idx = dr.minimum(mi.UInt32(u_cont), self.res_u - 1)
-        
-        # Mapping v (theta) : cos_theta [0, 1] -> [0, res_v]
-        # Note: On map souvent cos_theta directement pour avoir des aires égales
-        # si on découpe en anneaux, ou theta linéairement.
-        # Ici mapping linéaire de cos_theta pour simplicité (Nusselt-like)
-        # v=0 -> horizon, v=max -> zénith (normale)
-        v_cont = cos_theta * self.res_v
-        v_idx = dr.minimum(mi.UInt32(v_cont), self.res_v - 1)
-        
-        # Index 1D dans l'hémisphère
+        phi = dr.select(phi < 0, phi + 2 * dr.pi, phi)
+        u_idx = dr.minimum(mi.UInt32((phi / (2 * dr.pi)) * self.res_u), self.res_u - 1)
+        v_idx = dr.minimum(mi.UInt32(cos_theta * self.res_v), self.res_v - 1)
         return v_idx * self.res_u + u_idx
-    
-    def nearest_point(self, position):
-        """
-        Trouve l'indice du point le plus proche de la position donnée.
-        (devra être optimisé avec une structure de données spatiale)
-        """
-        p = mi.Point3f(position)
-        # Calculer les distances au carré pour éviter la racine carrée
-        diff = self.positions - p
-        dist2 = dr.squared_norm(diff)
 
-        # Trouver l'indice du minimum (argmin manuel en drjit)
-        min_val = dr.min(dist2)
-        indices = dr.arange(mi.UInt32, dr.width(dist2))
-        return dr.min(dr.select(dist2 == min_val, indices, dr.width(dist2)))
-    
+    def update(self, spatial_indices, directions, rewards, mask=True):
+        bin_idx = self._get_bin_indices(spatial_indices, directions)
+        flat_idx = spatial_indices * self.n_bins_per_point + bin_idx
+        dr.scatter_reduce(dr.ReduceOp.Add, self.sum_values, rewards, flat_idx, mask)
+        dr.scatter_reduce(dr.ReduceOp.Add, self.visit_counts, 1.0, flat_idx, mask)
 
-# new class able to construct a 3D point distribution on the surface of a scene (with normals) and store the irradiance values for each point, to be used in the 'Learning Light Transport' paper. The class should have methods to query the irradiance for a given point and direction, and to update the values based on new samples. The data structure should be efficient for use in a differentiable rendering context, allowing for gradient updates.
+    def nearest_point(self, positions):
+        n_queries = dr.width(positions)
+        min_dist2 = dr.full(mi.Float, 1e30, n_queries)
+        best_idx = dr.zeros(mi.UInt32, n_queries)
+        for i in range(self.n_points):
+            p_i = dr.gather(mi.Point3f, self.positions, i)
+            dist2 = dr.squared_norm(positions - p_i)
+            closer = dist2 < min_dist2
+            min_dist2 = dr.select(closer, dist2, min_dist2)
+            best_idx = dr.select(closer, mi.UInt32(i), best_idx)
+        return best_idx
+
+    def get_q_data(self, spatial_indices):
+        all_q = []
+        for i in range(self.n_bins_per_point):
+            flat_idx = spatial_indices * self.n_bins_per_point + i
+            val = dr.gather(mi.Float, self.sum_values, flat_idx)
+            count = dr.gather(mi.Float, self.visit_counts, flat_idx)
+            all_q.append(dr.select(count > 0, val / count, 0.0))
+        return all_q
+
+    def sample_direction(self, spatial_indices, sample):
+        n_queries = dr.width(spatial_indices)
+        all_q = self.get_q_data(spatial_indices)
+        q_sum = dr.zeros(mi.Float, n_queries)
+        for q in all_q: q_sum += q
+        epsilon = 0.1
+        
+        # Probabilités par bin
+        weights = [dr.select(q_sum > 0, (1.0 - epsilon) * q / q_sum + epsilon / self.n_bins_per_point, 1.0 / self.n_bins_per_point) for q in all_q]
+        
+        cum_weights = []
+        curr = dr.zeros(mi.Float, n_queries)
+        for w in weights:
+            curr += w
+            cum_weights.append(dr.detach(curr))
+        
+        u = sample.x
+        bin_idx = dr.zeros(mi.UInt32, n_queries)
+        for i in range(self.n_bins_per_point - 1):
+            bin_idx = dr.select(u > cum_weights[i], mi.UInt32(i + 1), bin_idx)
+        
+        # Sélection robuste des cumulative weights et probabilités sans concat
+        prev_c = dr.zeros(mi.Float, n_queries)
+        next_c = dr.zeros(mi.Float, n_queries)
+        prob_bin = dr.zeros(mi.Float, n_queries)
+        
+        for i in range(self.n_bins_per_point):
+            mask = (bin_idx == mi.UInt32(i))
+            if i > 0:
+                prev_c = dr.select(mask, cum_weights[i-1], prev_c)
+            next_c = dr.select(mask, cum_weights[i], next_c)
+            prob_bin = dr.select(mask, weights[i], prob_bin)
+            
+        u_local = (u - prev_c) / dr.maximum(next_c - prev_c, 1e-7)
+        
+        v_idx, u_idx = bin_idx // self.res_u, bin_idx % self.res_u
+        phi = (mi.Float(u_idx) + u_local) * (2 * dr.pi / self.res_u)
+        cos_theta = (mi.Float(v_idx) + sample.y) * (1.0 / self.res_v)
+        sin_theta = dr.safe_sqrt(1.0 - cos_theta * cos_theta)
+        w_local = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
+        
+        n = dr.gather(mi.Vector3f, self.normals, spatial_indices)
+        direction = mi.Frame3f(n).to_world(w_local)
+        
+        pdf = prob_bin * (self.n_bins_per_point / (2 * dr.pi))
+        
+        return direction, pdf
+
+    def compute_radiance_estimate(self, spatial_indices):
+        all_q = self.get_q_data(spatial_indices)
+        d_phi, d_cos = 2 * dr.pi / self.res_u, 1.0 / self.res_v
+        irradiance = dr.zeros(mi.Float, dr.width(spatial_indices))
+        for i in range(self.n_bins_per_point):
+            cos_j = (mi.Float(i // self.res_u) + 0.5) / self.res_v
+            irradiance += all_q[i] * cos_j * d_phi * d_cos
+        return irradiance / dr.pi
 
 class DistributeSurfacePointsonScene:
-    """
-    Classe pour distribuer des points sur les surfaces d'une scène et stocker les valeurs d'irradiance.
-    Permet de construire une distribution de points avec leurs normales, et de stocker les valeurs d'irradiance
-    pour chaque point et direction.
-    """
-
     def __init__(self, scene, n_points):
-        """
-        Initialise la distribution de points sur la scène.
-
-        :param scene: Instance de la scène Mitsuba à analyser.
-        :param n_points: Nombre total de points à distribuer sur les surfaces.
-        """
         self.scene = scene
-        self.n_points = n_points
-        
-        # 1. Échantillonnage de points sur les surfaces de la scène
-        # (On peut utiliser un échantillonneur de surface de Mitsuba ou une méthode personnalisée)
-        self.positions, self.normals = self._sample_points_on_scene()
-        self.n_points = dr.width(self.positions)
-        
-        # 2. Initialisation de la structure d'irradiance (SurfaceIrradianceVolume)
+        self.positions, self.normals = self._sample_points_on_scene(n_points)
         self.irradiance_volume = SurfaceIrradianceVolume(self.positions, self.normals)
 
-    def _sample_points_on_scene(self):
-        """
-        Méthode interne pour échantillonner des points sur les surfaces de la scène.
-        Retourne les positions et normales des points échantillonnés.
-        """
+    def _sample_points_on_scene(self, n_points):
         shapes = self.scene.shapes()
-        if not shapes:
-            return mi.Point3f(), mi.Vector3f()
-
-        n_per_shape = self.n_points // len(shapes)
-        if n_per_shape == 0:
-            n_per_shape = 1
-        
-        px, py, pz = [], [], []
-        nx, ny, nz = [], [], []
-        
+        n_per_shape = max(1, n_points // len(shapes))
+        px, py, pz, nx, ny, nz = [], [], [], [], [], []
         for i, shape in enumerate(shapes):
-            # Use PCG32 to generate a vector of random numbers at once.
-            # We provide a unique initstate per shape to ensure different sampling patterns.
             pcg = mi.PCG32(size=n_per_shape, initstate=i)
-            sample = mi.Point2f(pcg.next_float32(), pcg.next_float32())
-            
-            # Vectorized sampling: ps.p and ps.n will have width 'n_per_shape'
-            ps = shape.sample_position(0.0, sample)
-            px.append(ps.p.x)
-            py.append(ps.p.y)
-            pz.append(ps.p.z)
-            nx.append(ps.n.x)
-            ny.append(ps.n.y)
-            nz.append(ps.n.z)
-        
-        # Reconstruct vectorized Point3f and Vector3f from concatenated components
-        res_p = mi.Point3f(dr.concat(px), dr.concat(py), dr.concat(pz))
-        res_n = mi.Vector3f(dr.concat(nx), dr.concat(ny), dr.concat(nz))
-        
-        return res_p, res_n
-    
+            ps = shape.sample_position(0.0, mi.Point2f(pcg.next_float32(), pcg.next_float32()))
+            px.append(ps.p.x); py.append(ps.p.y); pz.append(ps.p.z)
+            nx.append(ps.n.x); ny.append(ps.n.y); nz.append(ps.n.z)
+        return mi.Point3f(dr.concat(px), dr.concat(py), dr.concat(pz)), mi.Vector3f(dr.concat(nx), dr.concat(ny), dr.concat(nz))
 
-    def display_points(self):
-        """
-        Affiche les points et leurs normales (pour debug).
-        """
-        # Ensure self.n_points is treated as an integer for the loop
-        for i in range(int(self.n_points)):
-            p = dr.gather(mi.Point3f, self.positions, i)
-            n = dr.gather(mi.Vector3f, self.normals, i)
-            print(f"Point {i}: Position {p}, Normal {n}")
+class RLIntegrator(mi.SamplingIntegrator):
+    def __init__(self, props=mi.Properties()):
+        super().__init__(props)
+        self.n_probes = props.get('n_probes', 1000)
+        self.volume = None
 
-    def save(self, filename, radius=0.01, scale=1.0):
-        """
-        Sauvegarde les points sous forme de petites sphères dans un fichier PLY.
-        L'ajout de la propriété 'radius' permet aux visualiseurs de les afficher
-        comme des sphères plutôt que de simples points.
-        """
-        # Conversion en numpy pour une extraction de données et une écriture efficaces.
-        # C'est beaucoup plus rapide que dr.gather dans une boucle Python.
-        # Mitsuba/DrJit exporte en (3, N), on transpose pour avoir (N, 3) pour l'itération.
-        p_np = np.array(self.positions).T * scale
-        n_np = np.array(self.normals).T
-        n_probes = p_np.shape[0] # Nombre de points après transposition
+    def sample(self, scene, sampler, ray, medium, active):
+        if self.volume is None:
+             self.volume = DistributeSurfacePointsonScene(scene, self.n_probes).irradiance_volume
+
+        throughput, result = mi.Spectrum(1.0), mi.Spectrum(0.0)
+        prev_idx, prev_dir = dr.zeros(mi.UInt32, dr.width(active)), mi.Vector3f(0.0)
+        has_prev = mi.Mask(False)
+        depth = 0
         
-        with open(filename, 'w') as f:
-            f.write(f"ply\nformat ascii 1.0\nelement vertex {2 * n_probes}\n")
-            f.write("property float x\nproperty float y\nproperty float z\n")
-            f.write(f"element edge {n_probes}\n")
-            f.write("property int vertex1\nproperty int vertex2\n")
-            f.write("end_header\n")
+        while dr.any(active) and depth < 5:
+            si = scene.ray_intersect(ray, active)
+            active &= si.is_valid()
             
-            segment_length = radius * scale
+            update_mask = active & has_prev
+            if dr.any(update_mask):
+                curr_idx = self.volume.nearest_point(si.p)
+                emitter = si.emitter(scene)
+                reward = dr.select(emitter != None, dr.mean(emitter.eval(si, update_mask)), 0.0)
+                reward += self.volume.compute_radiance_estimate(curr_idx)
+                self.volume.update(prev_idx, prev_dir, mi.Float(reward), update_mask)
+
+            emitter = si.emitter(scene)
+            active_emitter = active & (emitter != None)
+            if dr.any(active_emitter):
+                result += dr.select(active_emitter, throughput * emitter.eval(si, active_emitter), 0.0)
             
-            for i in range(n_probes):
-                x, y, z = p_np[i]
-                nx, ny, nz = n_np[i]
+            if not dr.any(active): break
                 
-                # Vertex 1: Original probe position
-                f.write(f"{x} {y} {z}\n")
-                # Vertex 2: Position translated along normal
-                f.write(f"{x + nx * segment_length} {y + ny * segment_length} {z + nz * segment_length}\n")
+            curr_idx = self.volume.nearest_point(si.p)
+            use_q = sampler.next_1d(active) < 0.8
+            wo_q, pdf_q = self.volume.sample_direction(curr_idx, sampler.next_2d(active))
             
-            for i in range(n_probes):
-                # Connect Vertex 2i and Vertex 2i+1
-                f.write(f"{2 * i} {2 * i + 1}\n")
+            bsdf = si.bsdf(ray)
+            ctx = mi.BSDFContext()
+            bs_sample, bs_weight = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
+            
+            direction = dr.select(use_q, wo_q, bs_sample.wo)
+            pdf = dr.select(use_q, pdf_q, bs_sample.pdf)
+            pdf = dr.maximum(pdf, 1e-7)
+            
+            throughput *= bsdf.eval(ctx, si, direction, active) * dr.abs(dr.dot(direction, si.n)) / pdf
+            ray = si.spawn_ray(direction)
+            
+            prev_idx, prev_dir, has_prev = curr_idx, direction, mi.Mask(active)
+            active &= (dr.max(throughput) > 0.0)
+            depth += 1
+            
+        return result, active, []
 
-   
-# --- Tests Rapides ---
-if __name__ == "__main__":
-    mi.set_variant('llvm_ad_rgb') # Ou scalar_rgb
-    
-    # 1. Création de quelques points (ex: 2 points sur un plan Z=0)
-    positions = mi.Point3f([0, 10], [0, 0], [0, 0])
-    normals = mi.Vector3f([0, 0], [0, 0], [1, 1]) # Normales vers Z+
-    
-    # Résolution faible pour le test (2x2 bins)
-    # Bins:
-    # v=0 (rasant), v=1 (zénith)
-    # u=0 (0-180°), u=1 (180-360°)
-    vol = SurfaceIrradianceVolume(positions, normals, 2, 2)
-    
-    # 2. Test d'Update
-    # On éclaire le point 0 avec une direction verticale (Z+)
-    # C'est le bin (v=1, u=quelconque)
-    idx = mi.Int32([0])
-    dir_up = mi.Vector3f([0, 0, 1])
-    reward = mi.Float([10.0])
-    
-    print("Update point 0, dir Z+ avec valeur 10.0")
-    vol.update(idx, dir_up, reward)
-    
-    # 3. Test de Query (Même direction)
-    q = vol.get_q_value(idx, dir_up)
-    print(f"Q-value (Point 0, Z+): {q}") # Devrait être 10.0
-    
-    # 4. Test d'Update cumulatif (Moyenne)
-    print("Update point 0, dir Z+ avec valeur 20.0")
-    vol.update(idx, dir_up, mi.Float([20.0]))
-    
-    q_new = vol.get_q_value(idx, dir_up)
-    print(f"Q-value (Point 0, Z+): {q_new}") # Devrait être (10+20)/2 = 15.0
-    
-    # 5. Test Direction différente (Point 0, direction X+)
-    # X+ est rasant (cos_theta ~ 0), donc v=0
-    dir_side = mi.Vector3f([1, 0, 0]) 
-    q_side = vol.get_q_value(idx, dir_side)
-    print(f"Q-value (Point 0, X+): {q_side}") # Devrait être 0.0 (bin différent)
-    
-    print("Tests terminés.")
-
-    # make a list of 10 randoms points with normals up
-    
-    n_points = 10
-    positions = np.random.rand(n_points, 3) * 10.0 # Random positions in a 10x10x10 cube
-    positions[:, 2] = 0 # All points on the plane Z=0
-    normals = np.tile([0, 0, 1], (n_points, 1)) # Normales vers Z+
-    
-    positions = np.ascontiguousarray(positions, dtype=np.float32).T
-    normals = np.ascontiguousarray(normals, dtype=np.float32).T
-    vol = SurfaceIrradianceVolume(positions, normals, 8, 8) # 8x8 bins
-
-    # chose a new random point with normal up
-    new_point = np.random.rand(3) * 10.0
-    new_point[2] = 0 # On the plane
-    new_normal = np.array([0, 0, 1])    
-
-    nearest_idx = vol.nearest_point(new_point)
-    # On utilise gather pour récupérer la position correspondant à l'indice trouvé
-    nearest_pos = dr.gather(mi.Point3f, vol.positions, nearest_idx)
-    
-    print(f"New point: {new_point}, Nearest point index: {nearest_idx}, Nearest point position: {nearest_pos}")
-
-    # Vérification avec numpy pour être sûr
-    all_pos_np = np.array(vol.positions).T # Convert back to (N, 3)
-    dists = np.linalg.norm(all_pos_np - new_point, axis=1)
-    np_nearest_idx = np.argmin(dists)
-    print(f"Numpy nearest index: {np_nearest_idx}, Numpy nearest position: {all_pos_np[np_nearest_idx]}")
-    
-    if int(nearest_idx[0]) == np_nearest_idx:
-        print("SUCCESS: Nearest point matches numpy result.")
-    else:
-        print("FAILURE: Nearest point does not match numpy result.")
-
-    # with numpy, we compute a tabular of the distance from the new point
-    # to all the points in the volume and print all the distances and the nearest point
-    print("Distances from new point to all points in the volume:")
-    for i in range(n_points):
-        dist = np.linalg.norm(all_pos_np[i] - new_point)
-        print(f"Point {i}: Position {all_pos_np[i]}, Distance: {dist}") 
-        
-
-    # Test of DistributeSurfacePointsonScene
-    scene = mi.load_file('scenes/cbox/cbox.xml')
-    distributor = DistributeSurfacePointsonScene(scene, n_points=10000)
-    #distributor.display_points()
-
-    distributor.save('points.ply', radius=50, scale=1.0)
+mi.register_integrator("rl_integrator", lambda props: RLIntegrator(props))
