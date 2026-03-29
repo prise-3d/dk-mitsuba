@@ -2,6 +2,7 @@ import drjit as dr
 import mitsuba as mi
 import numpy as np
 
+
 class SurfaceIrradianceVolume:
     """
     Structure de données pour le 'Learning Light Transport'.
@@ -133,8 +134,120 @@ class SurfaceIrradianceVolume:
         min_val = dr.min(dist2)
         indices = dr.arange(mi.UInt32, dr.width(dist2))
         return dr.min(dr.select(dist2 == min_val, indices, dr.width(dist2)))
+    
 
-# --- Zone de Test Rapide ---
+# new class able to construct a 3D point distribution on the surface of a scene (with normals) and store the irradiance values for each point, to be used in the 'Learning Light Transport' paper. The class should have methods to query the irradiance for a given point and direction, and to update the values based on new samples. The data structure should be efficient for use in a differentiable rendering context, allowing for gradient updates.
+
+class DistributeSurfacePointsonScene:
+    """
+    Classe pour distribuer des points sur les surfaces d'une scène et stocker les valeurs d'irradiance.
+    Permet de construire une distribution de points avec leurs normales, et de stocker les valeurs d'irradiance
+    pour chaque point et direction.
+    """
+
+    def __init__(self, scene, n_points):
+        """
+        Initialise la distribution de points sur la scène.
+
+        :param scene: Instance de la scène Mitsuba à analyser.
+        :param n_points: Nombre total de points à distribuer sur les surfaces.
+        """
+        self.scene = scene
+        self.n_points = n_points
+        
+        # 1. Échantillonnage de points sur les surfaces de la scène
+        # (On peut utiliser un échantillonneur de surface de Mitsuba ou une méthode personnalisée)
+        self.positions, self.normals = self._sample_points_on_scene()
+        self.n_points = dr.width(self.positions)
+        
+        # 2. Initialisation de la structure d'irradiance (SurfaceIrradianceVolume)
+        self.irradiance_volume = SurfaceIrradianceVolume(self.positions, self.normals)
+
+    def _sample_points_on_scene(self):
+        """
+        Méthode interne pour échantillonner des points sur les surfaces de la scène.
+        Retourne les positions et normales des points échantillonnés.
+        """
+        shapes = self.scene.shapes()
+        if not shapes:
+            return mi.Point3f(), mi.Vector3f()
+
+        n_per_shape = self.n_points // len(shapes)
+        if n_per_shape == 0:
+            n_per_shape = 1
+        
+        px, py, pz = [], [], []
+        nx, ny, nz = [], [], []
+        
+        for i, shape in enumerate(shapes):
+            # Use PCG32 to generate a vector of random numbers at once.
+            # We provide a unique initstate per shape to ensure different sampling patterns.
+            pcg = mi.PCG32(size=n_per_shape, initstate=i)
+            sample = mi.Point2f(pcg.next_float32(), pcg.next_float32())
+            
+            # Vectorized sampling: ps.p and ps.n will have width 'n_per_shape'
+            ps = shape.sample_position(0.0, sample)
+            px.append(ps.p.x)
+            py.append(ps.p.y)
+            pz.append(ps.p.z)
+            nx.append(ps.n.x)
+            ny.append(ps.n.y)
+            nz.append(ps.n.z)
+        
+        # Reconstruct vectorized Point3f and Vector3f from concatenated components
+        res_p = mi.Point3f(dr.concat(px), dr.concat(py), dr.concat(pz))
+        res_n = mi.Vector3f(dr.concat(nx), dr.concat(ny), dr.concat(nz))
+        
+        return res_p, res_n
+    
+
+    def display_points(self):
+        """
+        Affiche les points et leurs normales (pour debug).
+        """
+        # Ensure self.n_points is treated as an integer for the loop
+        for i in range(int(self.n_points)):
+            p = dr.gather(mi.Point3f, self.positions, i)
+            n = dr.gather(mi.Vector3f, self.normals, i)
+            print(f"Point {i}: Position {p}, Normal {n}")
+
+    def save(self, filename, radius=0.01, scale=1.0):
+        """
+        Sauvegarde les points sous forme de petites sphères dans un fichier PLY.
+        L'ajout de la propriété 'radius' permet aux visualiseurs de les afficher
+        comme des sphères plutôt que de simples points.
+        """
+        # Conversion en numpy pour une extraction de données et une écriture efficaces.
+        # C'est beaucoup plus rapide que dr.gather dans une boucle Python.
+        # Mitsuba/DrJit exporte en (3, N), on transpose pour avoir (N, 3) pour l'itération.
+        p_np = np.array(self.positions).T * scale
+        n_np = np.array(self.normals).T
+        n_probes = p_np.shape[0] # Nombre de points après transposition
+        
+        with open(filename, 'w') as f:
+            f.write(f"ply\nformat ascii 1.0\nelement vertex {2 * n_probes}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write(f"element edge {n_probes}\n")
+            f.write("property int vertex1\nproperty int vertex2\n")
+            f.write("end_header\n")
+            
+            segment_length = radius * scale
+            
+            for i in range(n_probes):
+                x, y, z = p_np[i]
+                nx, ny, nz = n_np[i]
+                
+                # Vertex 1: Original probe position
+                f.write(f"{x} {y} {z}\n")
+                # Vertex 2: Position translated along normal
+                f.write(f"{x + nx * segment_length} {y + ny * segment_length} {z + nz * segment_length}\n")
+            
+            for i in range(n_probes):
+                # Connect Vertex 2i and Vertex 2i+1
+                f.write(f"{2 * i} {2 * i + 1}\n")
+
+   
+# --- Tests Rapides ---
 if __name__ == "__main__":
     mi.set_variant('llvm_ad_rgb') # Ou scalar_rgb
     
@@ -218,4 +331,9 @@ if __name__ == "__main__":
         print(f"Point {i}: Position {all_pos_np[i]}, Distance: {dist}") 
         
 
+    # Test of DistributeSurfacePointsonScene
+    scene = mi.load_file('scenes/cbox/cbox.xml')
+    distributor = DistributeSurfacePointsonScene(scene, n_points=10000)
+    #distributor.display_points()
 
+    distributor.save('points.ply', radius=50, scale=1.0)
