@@ -1,12 +1,11 @@
-import drjit as dr
 import mitsuba as mi
+# Configure Mitsuba variant for tests
+mi.set_variant('llvm_ad_rgb')
+
+import drjit as dr
 import numpy as np
 import pytest
 from local_irradiance import SurfaceIrradianceVolume
-
-# Configure Mitsuba variant for tests
-#mi.set_variant('llvm_ad_rgb')
-mi.set_variant('scalar_rgb')
 
 
 def test_initialization():
@@ -76,7 +75,7 @@ def test_nearest_point():
     query_point = np.random.rand(3).astype(np.float32) * 10.0
     
     # Calcul via Dr.Jit
-    found_idx = vol.nearest_point(query_point)
+    found_idx = vol.nearest_point(mi.Point3f(query_point))
     
     # Calcul via Numpy (vérité terrain)
     dists = np.linalg.norm(pos_np - query_point, axis=1)
@@ -97,7 +96,7 @@ def test_nearest_point_exact():
     vol = SurfaceIrradianceVolume(pos_np.T, norm_np.T)
     
     # Requête sur le point à [1, 1, 0] (index 3)
-    query_point = [1.0, 1.0, 0.0]
+    query_point = mi.Point3f(1.0, 1.0, 0.0)
     found_idx = vol.nearest_point(query_point)
     
     assert int(found_idx[0]) == 3
