@@ -59,6 +59,33 @@ class SurfaceIrradianceVolume:
         dr.scatter_reduce(dr.ReduceOp.Add, self.sum_values, rewards, flat_indices)
         dr.scatter_reduce(dr.ReduceOp.Add, self.visit_counts, 1.0, flat_indices)
 
+    def get_total_visits(self, spatial_indices):
+        """Calcule le nombre total de visites pour les points donnés (somme des bins)."""
+        n_queries = dr.width(spatial_indices)
+        total = dr.zeros(mi.Float, n_queries)
+        for i in range(self.n_bins_per_point):
+            total += dr.gather(mi.Float, self.visit_counts, spatial_indices * self.n_bins_per_point + i)
+        return total
+
+    def pdf_direction(self, spatial_indices, directions):
+        """Évalue la PDF du volume pour une direction donnée (en steradians)."""
+        n_queries = dr.width(spatial_indices)
+        bin_indices = self._get_bin_indices(spatial_indices, directions)
+        
+        all_q = self.get_q_data(spatial_indices)
+        q_sum = dr.zeros(mi.Float, n_queries)
+        for q in all_q: q_sum += q
+        
+        epsilon = 0.1
+        prob = dr.zeros(mi.Float, n_queries)
+        for i in range(self.n_bins_per_point):
+            w = dr.select(q_sum > 0, 
+                          (1.0 - epsilon) * all_q[i] / q_sum + epsilon / self.n_bins_per_point, 
+                          1.0 / self.n_bins_per_point)
+            prob = dr.select(bin_indices == i, w, prob)
+            
+        return prob * (self.n_bins_per_point / (2 * dr.pi))
+
     def _get_bin_indices(self, spatial_indices, directions):
         """Transforme Direction Monde -> Index de Bin Local (u, v)"""
         n = dr.gather(mi.Vector3f, self.normals, spatial_indices)
@@ -217,36 +244,44 @@ class RLIntegrator(mi.SamplingIntegrator):
             if not dr.any(active): break
 
             
-            if self.enable_guiding:
-                # Echantillonnage guidé par RL
-                curr_idx = self.volume.nearest_point(si.p)
-                use_q = sampler.next_1d(active) < 0.8
-                wo_q, pdf_q = self.volume.sample_direction(curr_idx, sampler.next_2d(active))
-            else:
-                # Pas de guidage, échantillonnage BSDF classique
-                curr_idx = dr.zeros(mi.UInt32, dr.width(active))
-                use_q = dr.full(mi.Bool, False, dr.width(active))
-                wo_q = mi.Vector3f(0.0)
-                pdf_q = dr.zeros(mi.Float, dr.width(active))
             bsdf = si.bsdf(ray)
             ctx = mi.BSDFContext()
-            bs_sample, bs_weight = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
-            
-            # Choix entre direction guidée par RL ou échantillonnage BSDF
-            direction = dr.select(use_q, wo_q, bs_sample.wo)
-            # Calcul du throughput en fonction du choix d'échantillonnage
-            pdf = dr.select(use_q, pdf_q, bs_sample.pdf)
-            # Mise à jour du throughput
-            throughput *= bsdf.eval(ctx, si, direction, active) * dr.abs(dr.dot(direction, si.n)) / dr.maximum(pdf, 1e-7)
-            ray = si.spawn_ray(direction)
+
             if self.enable_guiding:
+                curr_idx = self.volume.nearest_point(si.p) # On le calcule une seule fois
+                
+                # Calcul de la confiance : alpha grimpe de 0 à 0.8 sur 200 visites
+                total_visits = self.volume.get_total_visits(curr_idx)
+                alpha = dr.clamp(total_visits / 200.0, 0.0, 0.8)
+                
+                # Tirage de la stratégie
+                use_guiding = sampler.next_1d(active) < alpha
+                
+                # Génération des deux propositions
+                wo_q, _ = self.volume.sample_direction(curr_idx, sampler.next_2d(active))
+                bs_sample, bs_weight = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
+                
+                # Direction finale
+                direction = dr.select(use_guiding, wo_q, bs_sample.wo)
+                
+                # MIS : On combine les PDF des deux stratégies
+                pdf_rl = self.volume.pdf_direction(curr_idx, direction)
+                pdf_bsdf = bsdf.pdf(ctx, si, direction, active)
+                combined_pdf = alpha * pdf_rl + (1.0 - alpha) * pdf_bsdf
+                
+                throughput *= bsdf.eval(ctx, si, direction, active) * dr.abs(dr.dot(direction, si.n)) / dr.maximum(combined_pdf, 1e-7)
                 prev_idx, prev_dir, has_prev = curr_idx, direction, active
             else:
+                # Mode de contrôle : Path Tracing pur (seul le matériau décide)
+                bs_sample, bs_weight = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
+                direction = bs_sample.wo
+                throughput *= bs_weight
                 has_prev = dr.full(mi.Bool, False, dr.width(active))
+
+            ray = si.spawn_ray(direction)
             active &= dr.any(throughput != 0.0)
             depth += 1
             
         return result, active, []
 
 mi.register_integrator("rl_integrator", lambda props: RLIntegrator(props))
-
