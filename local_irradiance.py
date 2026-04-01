@@ -76,7 +76,7 @@ class SurfaceIrradianceVolume:
         q_sum = dr.zeros(mi.Float, n_queries)
         for q in all_q: q_sum += q
         
-        epsilon = 0.1
+        epsilon = 0.01 # Doit être identique à sample_direction pour éviter le biais
         prob = dr.zeros(mi.Float, n_queries)
         for i in range(self.n_bins_per_point):
             w = dr.select(q_sum > 0, 
@@ -129,7 +129,7 @@ class SurfaceIrradianceVolume:
         all_q = self.get_q_data(spatial_indices)
         q_sum = dr.zeros(mi.Float, n_queries)
         for q in all_q: q_sum += q
-        epsilon = 0.1
+        epsilon = 0.01 # Exploration interne
         weights = [dr.select(q_sum > 0, (1.0 - epsilon) * q / q_sum + epsilon / self.n_bins_per_point, 1.0 / self.n_bins_per_point) for q in all_q]
         cum_weights = []
         curr = dr.zeros(mi.Float, n_queries)
@@ -175,20 +175,34 @@ class SurfaceIrradianceVolume:
 
 
 class DistributeSurfacePointsonScene:
-    def __init__(self, scene, n_points):
+    def __init__(self, scene, n_points, resolution_u=8, resolution_v=8, ignore_source=True):
         self.scene = scene
+        self.ignore_source = ignore_source
         self.positions, self.normals = self._sample_points_on_scene(n_points)
         self.irradiance_volume = SurfaceIrradianceVolume(self.positions, self.normals)
 
     def _sample_points_on_scene(self, n_points):
         shapes = self.scene.shapes()
-        n_per_shape = max(1, n_points // len(shapes))
+        
+        if self.ignore_source:
+            # On ne conserve que les objets qui ne sont pas des émetteurs de lumière
+            valid_shapes = [s for s in shapes if s.emitter() is None]
+            if len(valid_shapes) > 0:
+                shapes = valid_shapes
+
+        n_shapes = len(shapes)
+        if n_shapes == 0:
+            # Sécurité pour éviter un crash sur dr.concat si aucune forme n'est trouvée
+            return mi.Point3f(0.0), mi.Vector3f(0.0, 0.0, 1.0)
+
+        n_per_shape = max(1, n_points // n_shapes)
         px, py, pz, nx, ny, nz = [], [], [], [], [], []
         for i, shape in enumerate(shapes):
             pcg = mi.PCG32(size=n_per_shape, initstate=i)
             ps = shape.sample_position(0.0, mi.Point2f(pcg.next_float32(), pcg.next_float32()))
             px.append(ps.p.x); py.append(ps.p.y); pz.append(ps.p.z)
             nx.append(ps.n.x); ny.append(ps.n.y); nz.append(ps.n.z)
+            
         return mi.Point3f(dr.concat(px), dr.concat(py), dr.concat(pz)), mi.Vector3f(dr.concat(nx), dr.concat(ny), dr.concat(nz))
 
     def save(self, filename, radius=0.01, scale=1.0):
@@ -210,7 +224,7 @@ class RLIntegrator(mi.SamplingIntegrator):
         self.enable_guiding = props.get('enable_guiding', True)
         self.volume = None
 
-    def sample(self, scene, sampler, ray, medium, active):
+    def sample(self, scene, sampler, ray, medium, active, update=True):
         if self.enable_guiding and self.volume is None:
              self.volume = DistributeSurfacePointsonScene(scene, self.n_probes).irradiance_volume
 
@@ -224,14 +238,20 @@ class RLIntegrator(mi.SamplingIntegrator):
             si = scene.ray_intersect(ray, active)
             active &= si.is_valid()
 
-
             # Mise à jour de la valeur Q pour l'étape précédente
-            if self.enable_guiding and dr.any(has_prev):
+            if update and self.enable_guiding and dr.any(has_prev):
                 curr_idx = self.volume.nearest_point(si.p)
                 emitter = si.emitter(scene)
                 has_emitter = active & (emitter != None)
-                reward = dr.select(has_emitter, dr.mean(emitter.eval(si, has_emitter)), 0.0)
-                reward += self.volume.compute_radiance_estimate(curr_idx)
+
+                # Récompense simple (Luminance directe + estimation indirecte)
+                reward = dr.select(has_emitter, mi.luminance(emitter.eval(si, has_emitter)), 0.0)
+                
+                # Pondération par l'albedo pour une propagation TD correcte
+                albedo = mi.luminance(si.bsdf().eval_diffuse_reflectance(si))
+                L_indirect = albedo * self.volume.compute_radiance_estimate(curr_idx)
+                reward += L_indirect
+                
                 self.volume.update(prev_idx, prev_dir, reward)
 
             # Contribution directe des émetteurs    
@@ -248,29 +268,37 @@ class RLIntegrator(mi.SamplingIntegrator):
             ctx = mi.BSDFContext()
 
             if self.enable_guiding:
-                curr_idx = self.volume.nearest_point(si.p) # On le calcule une seule fois
+                alpha = 0.8 # Probabilité de choisir le guidage
+                curr_idx = self.volume.nearest_point(si.p)
                 
-                # Calcul de la confiance : alpha grimpe de 0 à 0.8 sur 200 visites
-                total_visits = self.volume.get_total_visits(curr_idx)
-                alpha = dr.clamp(total_visits / 200.0, 0.0, 0.8)
+                # Désactiver le guidage sur les surfaces trop lisses (Delta/Specular)
+                is_specular = (bsdf.flags() & int(mi.BSDFFlags.Delta)) != 0
+                active_guiding = active & ~is_specular
                 
-                # Tirage de la stratégie
-                use_guiding = sampler.next_1d(active) < alpha
+                use_guiding = (sampler.next_1d(active) < alpha) & active_guiding
                 
-                # Génération des deux propositions
-                wo_q, _ = self.volume.sample_direction(curr_idx, sampler.next_2d(active))
+                # Génération des échantillons
+                wo_rl, pdf_rl_sample = self.volume.sample_direction(curr_idx, sampler.next_2d(active))
                 bs_sample, bs_weight = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
                 
-                # Direction finale
-                direction = dr.select(use_guiding, wo_q, bs_sample.wo)
+                direction = dr.select(use_guiding, wo_rl, bs_sample.wo)
                 
-                # MIS : On combine les PDF des deux stratégies
+                # Calcul des PDFs pour le MIS (Multiple Importance Sampling)
                 pdf_rl = self.volume.pdf_direction(curr_idx, direction)
-                pdf_bsdf = bsdf.pdf(ctx, si, direction, active)
-                combined_pdf = alpha * pdf_rl + (1.0 - alpha) * pdf_bsdf
+                pdf_bsdf = dr.select(use_guiding, bsdf.pdf(ctx, si, direction, active), bs_sample.pdf)
                 
-                throughput *= bsdf.eval(ctx, si, direction, active) * dr.abs(dr.dot(direction, si.n)) / dr.maximum(combined_pdf, 1e-7)
-                prev_idx, prev_dir, has_prev = curr_idx, direction, active
+                # PDF combinée (Mélange des deux stratégies)
+                pdf_mix = alpha * pdf_rl + (1.0 - alpha) * pdf_bsdf
+                
+                # Énergie du BSDF (f_r * cos)
+                energy = dr.select(use_guiding, bsdf.eval(ctx, si, direction, active) * dr.abs(dr.dot(direction, si.n)), bs_weight * bs_sample.pdf)
+                
+                # Appliquer le poids MIS seulement si le guidage est possible, sinon garder le poids BSDF standard
+                throughput *= dr.select(active_guiding, 
+                                        energy / dr.maximum(pdf_mix, 1e-7), 
+                                        bs_weight)
+                
+                prev_idx, prev_dir, has_prev = curr_idx, direction, active_guiding
             else:
                 # Mode de contrôle : Path Tracing pur (seul le matériau décide)
                 bs_sample, bs_weight = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)

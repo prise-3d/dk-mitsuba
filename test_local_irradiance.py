@@ -4,8 +4,10 @@ mi.set_variant('llvm_ad_rgb')
 
 import drjit as dr
 import numpy as np
+import os
 import pytest
-from local_irradiance import SurfaceIrradianceVolume
+from local_irradiance import SurfaceIrradianceVolume, DistributeSurfacePointsonScene
+
 
 
 def test_initialization():
@@ -100,6 +102,41 @@ def test_nearest_point_exact():
     found_idx = vol.nearest_point(query_point)
     
     assert int(found_idx[0]) == 3
+
+# test sample_points_on_scene
+def test_sample_points_on_scene():
+    """Vérifie que la fonction de sampling génère le bon nombre de points et que les données sont cohérentes."""
+    scene = mi.load_dict({'type': 'scene', 's': {'type': 'sphere'}})
+    n_points = 50
+    distrib = DistributeSurfacePointsonScene(scene, n_points)
+    
+    assert dr.width(distrib.positions) > 0
+    assert dr.width(distrib.normals) > 0
+    
+    # Vérifier que les normales sont unitaires
+    norms = np.linalg.norm(np.array(distrib.normals), axis=0)
+    assert np.allclose(norms, 1.0)
+
+# test save function in DistrubuteSurfacePointsonScene
+def test_save_function():
+    """Vérifie que la fonction de sauvegarde crée un fichier avec les bonnes données."""
+    delete_files = False    
+    scene_path='scenes/cbox/cbox.xml'
+    scene = mi.load_file(scene_path)
+    distrib = DistributeSurfacePointsonScene(scene, 1000)
+    
+    # Sauvegarder dans un fichier temporaire
+    output_path = 'test_surface_points.ply'
+    distrib.save(output_path)
+    
+
+    assert os.path.exists(output_path)
+    with open(output_path, 'r') as f:
+        assert f.readline().strip() == "ply"
+
+    if delete_files:
+        os.remove(output_path)
+
 
 if __name__ == "__main__":
     pytest.main([__file__])
