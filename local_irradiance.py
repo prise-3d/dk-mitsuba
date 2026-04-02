@@ -222,9 +222,10 @@ class RLIntegrator(mi.SamplingIntegrator):
         super().__init__(props)
         self.n_probes = props.get('n_probes', 1000)
         self.enable_guiding = props.get('enable_guiding', True)
+        self.update_q = props.get('update_q', True)
         self.volume = None
 
-    def sample(self, scene, sampler, ray, medium, active, update=True):
+    def sample(self, scene, sampler, ray, medium, active, update_q=True):
         if self.enable_guiding and self.volume is None:
              self.volume = DistributeSurfacePointsonScene(scene, self.n_probes).irradiance_volume
 
@@ -239,7 +240,7 @@ class RLIntegrator(mi.SamplingIntegrator):
             active &= si.is_valid()
 
             # Mise à jour de la valeur Q pour l'étape précédente
-            if update and self.enable_guiding and dr.any(has_prev):
+            if self.update_q and self.enable_guiding and dr.any(has_prev):
                 curr_idx = self.volume.nearest_point(si.p)
                 emitter = si.emitter(scene)
                 has_emitter = active & (emitter != None)
