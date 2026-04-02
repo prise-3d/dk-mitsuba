@@ -136,19 +136,28 @@ class SurfaceIrradianceVolume:
         all_q = self.get_q_data(spatial_indices)
         q_sum = dr.zeros(mi.Float, n_queries)
         for q in all_q: q_sum += q
-        epsilon = 0.01 # Exploration interne
-        weights = [dr.select(q_sum > 0, (1.0 - epsilon) * q / q_sum + epsilon / self.n_bins_per_point, 1.0 / self.n_bins_per_point) for q in all_q]
+        
+        epsilon = 0.05 # Augmenté pour une exploration plus robuste au début
+        
+        # Calcul des poids avec protection contre les q_sum nuls ou très faibles
+        weights = [dr.select(q_sum > 1e-6, 
+                             (1.0 - epsilon) * q / q_sum + epsilon / self.n_bins_per_point, 
+                             1.0 / self.n_bins_per_point) for q in all_q]
+        
         cum_weights = []
         curr = dr.zeros(mi.Float, n_queries)
         for w in weights:
             curr += w
             cum_weights.append(curr)
+        
         u = sample.x
         bin_idx = dr.zeros(mi.UInt32, n_queries)
         for i in range(self.n_bins_per_point - 1):
             bin_idx = dr.select(u > cum_weights[i], mi.UInt32(i + 1), bin_idx)
+        
         v_idx, u_idx = bin_idx // self.res_u, bin_idx % self.res_u
         
+        # Re-stratification de u pour l'échantillonnage à l'intérieur du bin
         prev_c = dr.zeros(mi.Float, n_queries)
         next_c = dr.zeros(mi.Float, n_queries)
         for i in range(self.n_bins_per_point):
@@ -156,10 +165,15 @@ class SurfaceIrradianceVolume:
             next_c = dr.select(bin_idx == i, cum_weights[i], next_c)
 
         u_local = (u - prev_c) / dr.maximum(next_c - prev_c, 1e-7)
+        u_local = dr.clamp(u_local, 0.0, 1.0)
+        
         phi = (mi.Float(u_idx) + u_local) * (2 * dr.pi / self.res_u)
         cos_theta = (mi.Float(v_idx) + sample.y) * (1.0 / self.res_v)
+        cos_theta = dr.clamp(cos_theta, 0.0, 1.0)
+        
         sin_theta = dr.safe_sqrt(1.0 - cos_theta * cos_theta)
         w_local = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
+        
         n = dr.gather(mi.Vector3f, self.normals, spatial_indices)
         direction = mi.Frame3f(n).to_world(w_local)
         
@@ -167,7 +181,19 @@ class SurfaceIrradianceVolume:
         for i in range(self.n_bins_per_point):
             pdf = dr.select(bin_idx == i, weights[i], pdf)
         pdf *= (self.n_bins_per_point / (2 * dr.pi))
+        
         return direction, pdf
+
+    def get_stats(self):
+        """Retourne des statistiques sur l'apprentissage."""
+        total_visits = dr.sum(self.visit_counts)[0]
+        max_q = dr.max(self.sum_values / dr.maximum(self.visit_counts, 1.0))[0]
+        mean_q = dr.sum(self.sum_values)[0] / dr.maximum(total_visits, 1.0)
+        return {
+            "total_visits": total_visits,
+            "max_q": max_q,
+            "mean_q": mean_q
+        }
 
     def compute_radiance_estimate(self, spatial_indices):
         """Estime la radiance sortante diffuse via l'irradiance apprise."""
@@ -285,7 +311,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                 
                 # Vérifier si la sonde est utilisable (même orientation que la surface)
                 probe_n = dr.gather(mi.Vector3f, self.volume.normals, curr_idx)
-                same_orientation = dr.dot(si.n, probe_n) > 0.5
+                same_orientation = dr.dot(si.n, probe_n) > 0.1 # Seuil assoupli
                 
                 # Désactiver le guidage sur les surfaces trop lisses (Delta/Specular)
                 is_specular = (bsdf.flags() & int(mi.BSDFFlags.Delta)) != 0
@@ -309,18 +335,22 @@ class RLIntegrator(mi.SamplingIntegrator):
                 
                 # Calcul des PDFs pour le MIS (Multiple Importance Sampling)
                 pdf_rl = self.volume.pdf_direction(curr_idx, direction)
-                pdf_bsdf = dr.select(use_guiding, bsdf.pdf(ctx, si, wo_local, active), bs_sample.pdf)
+                pdf_bsdf = bsdf.pdf(ctx, si, wo_local, active)
                 
                 # PDF combinée (Balance Heuristic)
                 pdf_mix = alpha * pdf_rl + (1.0 - alpha) * pdf_bsdf
                 
-                # Calcul de l'énergie (f_r * cos)
-                # Note: On utilise max(0, dot) pour éviter les énergies négatives
+                # Mise à jour du throughput avec le poids MIS
+                # Poids = f / pdf_mix
+                # Si use_guiding: energy = bsdf.eval * cos, throughput *= energy / pdf_mix
+                # Si ~use_guiding: direction est wo_bsdf, weight est bs_weight = (bsdf.eval * cos) / pdf_bsdf
+                # On veut multiplier par (bsdf.eval * cos) / pdf_mix
+                # Ce qui revient à multiplier par (bs_weight * pdf_bsdf) / pdf_mix
+                
                 energy = dr.select(use_guiding, 
                                    bsdf.eval(ctx, si, wo_local, active) * dr.maximum(0.0, dr.dot(direction, si.n)), 
                                    bs_weight * bs_sample.pdf)
                 
-                # Mise à jour du throughput avec le poids MIS
                 throughput *= dr.select(active_guiding, 
                                         energy / dr.maximum(pdf_mix, 1e-7), 
                                         bs_weight)
