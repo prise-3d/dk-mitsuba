@@ -50,14 +50,14 @@ class SurfaceIrradianceVolume:
         count = dr.gather(mi.Float, self.visit_counts, flat_indices)
         return dr.select(count > 0, total_value / count, 0.0)
 
-    def update(self, spatial_indices, directions, rewards):
+    def update(self, spatial_indices, directions, rewards, active):
         """
         Met à jour les statistiques (accumule la récompense et incrémente le compteur).
         """
         bin_indices = self._get_bin_indices(spatial_indices, directions)
         flat_indices = spatial_indices * self.n_bins_per_point + bin_indices
-        dr.scatter_reduce(dr.ReduceOp.Add, self.sum_values, rewards, flat_indices)
-        dr.scatter_reduce(dr.ReduceOp.Add, self.visit_counts, 1.0, flat_indices)
+        dr.scatter_reduce(dr.ReduceOp.Add, self.sum_values, rewards, flat_indices, active)
+        dr.scatter_reduce(dr.ReduceOp.Add, self.visit_counts, 1.0, flat_indices, active)
 
     def get_total_visits(self, spatial_indices):
         """Calcule le nombre total de visites pour les points donnés (somme des bins)."""
@@ -70,13 +70,19 @@ class SurfaceIrradianceVolume:
     def pdf_direction(self, spatial_indices, directions):
         """Évalue la PDF du volume pour une direction donnée (en steradians)."""
         n_queries = dr.width(spatial_indices)
+        
+        # On doit s'assurer que la direction est dans l'hémisphère de la sonde
+        n = dr.gather(mi.Vector3f, self.normals, spatial_indices)
+        w_local = mi.Frame3f(n).to_local(directions)
+        active_hemi = w_local.z > 0
+        
         bin_indices = self._get_bin_indices(spatial_indices, directions)
         
         all_q = self.get_q_data(spatial_indices)
         q_sum = dr.zeros(mi.Float, n_queries)
         for q in all_q: q_sum += q
         
-        epsilon = 0.01 # Doit être identique à sample_direction pour éviter le biais
+        epsilon = 0.01 
         prob = dr.zeros(mi.Float, n_queries)
         for i in range(self.n_bins_per_point):
             w = dr.select(q_sum > 0, 
@@ -84,7 +90,8 @@ class SurfaceIrradianceVolume:
                           1.0 / self.n_bins_per_point)
             prob = dr.select(bin_indices == i, w, prob)
             
-        return prob * (self.n_bins_per_point / (2 * dr.pi))
+        pdf = prob * (self.n_bins_per_point / (2 * dr.pi))
+        return dr.select(active_hemi, pdf, 0.0)
 
     def _get_bin_indices(self, spatial_indices, directions):
         """Transforme Direction Monde -> Index de Bin Local (u, v)"""
@@ -241,19 +248,23 @@ class RLIntegrator(mi.SamplingIntegrator):
 
             # Mise à jour de la valeur Q pour l'étape précédente
             if self.update_q and self.enable_guiding and dr.any(has_prev):
+                # On ne calcule la récompense que si l'intersection est valide
                 curr_idx = self.volume.nearest_point(si.p)
+                
+                # Récompense directe
                 emitter = si.emitter(scene)
-                has_emitter = active & (emitter != None)
-
-                # Récompense simple (Luminance directe + estimation indirecte)
-                reward = dr.select(has_emitter, mi.luminance(emitter.eval(si, has_emitter)), 0.0)
+                has_emitter = si.is_valid() & (emitter != None)
+                L_direct = dr.select(has_emitter, mi.luminance(emitter.eval(si, has_emitter)), 0.0)
                 
-                # Pondération par l'albedo pour une propagation TD correcte
-                albedo = mi.luminance(si.bsdf().eval_diffuse_reflectance(si))
+                # Récompense indirecte (estimation par le volume à l'intersection actuelle)
+                # On ne l'estime que si l'intersection est valide
+                albedo = dr.select(si.is_valid(), mi.luminance(si.bsdf().eval_diffuse_reflectance(si)), 0.0)
                 L_indirect = albedo * self.volume.compute_radiance_estimate(curr_idx)
-                reward += L_indirect
                 
-                self.volume.update(prev_idx, prev_dir, reward)
+                reward = L_direct + L_indirect
+                
+                # On met à jour le volume pour l'étape précédente (has_prev)
+                self.volume.update(prev_idx, prev_dir, reward, has_prev)
 
             # Contribution directe des émetteurs    
             emitter = si.emitter(scene)
@@ -269,32 +280,47 @@ class RLIntegrator(mi.SamplingIntegrator):
             ctx = mi.BSDFContext()
 
             if self.enable_guiding:
-                alpha = 0.8 # Probabilité de choisir le guidage
+                alpha = 0.8
                 curr_idx = self.volume.nearest_point(si.p)
+                
+                # Vérifier si la sonde est utilisable (même orientation que la surface)
+                probe_n = dr.gather(mi.Vector3f, self.volume.normals, curr_idx)
+                same_orientation = dr.dot(si.n, probe_n) > 0.5
                 
                 # Désactiver le guidage sur les surfaces trop lisses (Delta/Specular)
                 is_specular = (bsdf.flags() & int(mi.BSDFFlags.Delta)) != 0
-                active_guiding = active & ~is_specular
+                active_guiding = active & ~is_specular & same_orientation
                 
+                # Choix de la stratégie (Guiding ou BSDF)
                 use_guiding = (sampler.next_1d(active) < alpha) & active_guiding
                 
-                # Génération des échantillons
+                # Échantillonnage selon les deux stratégies
                 wo_rl, pdf_rl_sample = self.volume.sample_direction(curr_idx, sampler.next_2d(active))
                 bs_sample, bs_weight = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
                 
-                direction = dr.select(use_guiding, wo_rl, bs_sample.wo)
+                # Convertir l'échantillon BSDF en coordonnées monde
+                wo_bsdf = si.to_world(bs_sample.wo)
+                
+                # Direction finale (monde)
+                direction = dr.select(use_guiding, wo_rl, wo_bsdf)
+                
+                # Direction locale pour les appels BSDF
+                wo_local = si.to_local(direction)
                 
                 # Calcul des PDFs pour le MIS (Multiple Importance Sampling)
                 pdf_rl = self.volume.pdf_direction(curr_idx, direction)
-                pdf_bsdf = dr.select(use_guiding, bsdf.pdf(ctx, si, direction, active), bs_sample.pdf)
+                pdf_bsdf = dr.select(use_guiding, bsdf.pdf(ctx, si, wo_local, active), bs_sample.pdf)
                 
-                # PDF combinée (Mélange des deux stratégies)
+                # PDF combinée (Balance Heuristic)
                 pdf_mix = alpha * pdf_rl + (1.0 - alpha) * pdf_bsdf
                 
-                # Énergie du BSDF (f_r * cos)
-                energy = dr.select(use_guiding, bsdf.eval(ctx, si, direction, active) * dr.abs(dr.dot(direction, si.n)), bs_weight * bs_sample.pdf)
+                # Calcul de l'énergie (f_r * cos)
+                # Note: On utilise max(0, dot) pour éviter les énergies négatives
+                energy = dr.select(use_guiding, 
+                                   bsdf.eval(ctx, si, wo_local, active) * dr.maximum(0.0, dr.dot(direction, si.n)), 
+                                   bs_weight * bs_sample.pdf)
                 
-                # Appliquer le poids MIS seulement si le guidage est possible, sinon garder le poids BSDF standard
+                # Mise à jour du throughput avec le poids MIS
                 throughput *= dr.select(active_guiding, 
                                         energy / dr.maximum(pdf_mix, 1e-7), 
                                         bs_weight)
@@ -303,7 +329,7 @@ class RLIntegrator(mi.SamplingIntegrator):
             else:
                 # Mode de contrôle : Path Tracing pur (seul le matériau décide)
                 bs_sample, bs_weight = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
-                direction = bs_sample.wo
+                direction = si.to_world(bs_sample.wo)
                 throughput *= bs_weight
                 has_prev = dr.full(mi.Bool, False, dr.width(active))
 
