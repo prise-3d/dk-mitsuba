@@ -2,371 +2,165 @@ import drjit as dr
 import mitsuba as mi
 import numpy as np
 
-
 class SurfaceIrradianceVolume:
-    """
-    Structure de données pour le 'Learning Light Transport'.
-    
-    Elle gère un ensemble de points discrets sur les surfaces (positions + normales).
-    À chaque point est attachée une hémisphère discrétisée (tableau 2D) stockant :
-    - La somme des récompenses (pour calculer Q)
-    - Le nombre de visites
-    """
-
-    def __init__(self, positions, normals, resolution_u=8, resolution_v=8):
-        """
-        Initialise la structure.
-
-        :param positions: [N, 3] Array des positions des points sur la surface.
-        :param normals:   [N, 3] Array des normales associées.
-        :param resolution_u: Résolution azimutale (phi) de l'hémisphère.
-        :param resolution_v: Résolution zénithale (theta) de l'hémisphère.
-        """
-        self.positions = mi.Point3f(positions)
-        self.normals = mi.Vector3f(normals)
-        
-        # Dimensions
+    def __init__(self, scene, positions, normals, resolution_u=8, resolution_v=8, grid_res=16):
+        self.positions, self.normals = mi.Point3f(positions), mi.Vector3f(normals)
         self.n_points = dr.width(self.positions)
-        self.res_u = resolution_u
-        self.res_v = resolution_v
-        self.n_bins_per_point = resolution_u * resolution_v
-        
-        # Stockage plat pour Dr.Jit (Structure of Arrays)
-        # Taille totale = n_points * n_bins_per_point
+        self.res_u, self.res_v, self.n_bins_per_point = resolution_u, resolution_v, resolution_u * resolution_v
         total_size = self.n_points * self.n_bins_per_point
-        
-        # On stocke la somme des valeurs pour permettre des mises à jour atomiques faciles
-        # Q = sum_values / visit_counts
-        self.sum_values = dr.zeros(mi.Float, total_size)
-        self.visit_counts = dr.zeros(mi.Float, total_size) # Float pour faciliter les divisions
+        self.sum_r, self.sum_g, self.sum_b, self.visit_counts = dr.zeros(mi.Float, total_size), dr.zeros(mi.Float, total_size), dr.zeros(mi.Float, total_size), dr.zeros(mi.Float, total_size)
+        self.bin_cosines = [(mi.Float(i // resolution_u) + 0.5) / resolution_v for i in range(self.n_bins_per_point)]
+        self.grid_res, bbox = grid_res, scene.bbox()
+        self.grid_min, self.grid_max = mi.Point3f(bbox.min), mi.Point3f(bbox.max)
+        self.grid_size = dr.maximum(self.grid_max - self.grid_min, 1e-4)
+        self._build_grid()
 
-    def get_q_value(self, spatial_indices, directions):
-        """
-        Récupère la valeur Q (moyenne) pour des points spatiaux donnés et des directions données.
-        """
-        bin_indices = self._get_bin_indices(spatial_indices, directions)
-        flat_indices = spatial_indices * self.n_bins_per_point + bin_indices
-        total_value = dr.gather(mi.Float, self.sum_values, flat_indices)
-        count = dr.gather(mi.Float, self.visit_counts, flat_indices)
-        return dr.select(count > 0, total_value / count, 0.0)
+    def _build_grid(self):
+        res = self.grid_res
+        idx = dr.arange(mi.UInt32, res**3)
+        p = self.grid_min + self.grid_size * mi.Vector3f((mi.Float(idx % res) + 0.5) / res, (mi.Float((idx // res) % res) + 0.5) / res, (mi.Float(idx // (res * res)) + 0.5) / res)
+        best_indices, min_dist2 = dr.zeros(mi.UInt32, dr.width(p)), dr.full(mi.Float, 1e30, dr.width(p))
+        for i in range(self.n_points):
+            d2 = dr.squared_norm(p - dr.gather(mi.Point3f, self.positions, i))
+            is_closer = d2 < min_dist2
+            min_dist2, best_indices = dr.select(is_closer, d2, min_dist2), dr.select(is_closer, mi.UInt32(i), best_indices)
+        self.grid_data = best_indices
+
+    def nearest_point(self, p):
+        p_rel = (p - self.grid_min) / self.grid_size
+        idx = dr.clip(mi.UInt32(p_rel.z * self.grid_res), 0, self.grid_res - 1) * (self.grid_res**2) + dr.clip(mi.UInt32(p_rel.y * self.grid_res), 0, self.grid_res - 1) * self.grid_res + dr.clip(mi.UInt32(p_rel.x * self.grid_res), 0, self.grid_res - 1)
+        return dr.gather(mi.UInt32, self.grid_data, idx)
 
     def update(self, spatial_indices, directions, rewards, active):
-        """
-        Met à jour les statistiques (accumule la récompense et incrémente le compteur).
-        """
-        bin_indices = self._get_bin_indices(spatial_indices, directions)
-        flat_indices = spatial_indices * self.n_bins_per_point + bin_indices
-        dr.scatter_reduce(dr.ReduceOp.Add, self.sum_values, rewards, flat_indices, active)
-        dr.scatter_reduce(dr.ReduceOp.Add, self.visit_counts, 1.0, flat_indices, active)
-
-    def get_total_visits(self, spatial_indices):
-        """Calcule le nombre total de visites pour les points donnés (somme des bins)."""
-        n_queries = dr.width(spatial_indices)
-        total = dr.zeros(mi.Float, n_queries)
-        for i in range(self.n_bins_per_point):
-            total += dr.gather(mi.Float, self.visit_counts, spatial_indices * self.n_bins_per_point + i)
-        return total
-
-    def pdf_direction(self, spatial_indices, directions):
-        """Évalue la PDF du volume pour une direction donnée (en steradians)."""
-        n_queries = dr.width(spatial_indices)
-        
-        # On doit s'assurer que la direction est dans l'hémisphère de la sonde
         n = dr.gather(mi.Vector3f, self.normals, spatial_indices)
-        w_local = mi.Frame3f(n).to_local(directions)
-        active_hemi = w_local.z > 0
-        
-        bin_indices = self._get_bin_indices(spatial_indices, directions)
-        
-        all_q = self.get_q_data(spatial_indices)
-        q_sum = dr.zeros(mi.Float, n_queries)
-        for q in all_q: q_sum += q
-        
-        epsilon = 0.01 
-        prob = dr.zeros(mi.Float, n_queries)
-        for i in range(self.n_bins_per_point):
-            w = dr.select(q_sum > 0, 
-                          (1.0 - epsilon) * all_q[i] / q_sum + epsilon / self.n_bins_per_point, 
-                          1.0 / self.n_bins_per_point)
-            prob = dr.select(bin_indices == i, w, prob)
-            
-        pdf = prob * (self.n_bins_per_point / (2 * dr.pi))
-        return dr.select(active_hemi, pdf, 0.0)
-
-    def _get_bin_indices(self, spatial_indices, directions):
-        """Transforme Direction Monde -> Index de Bin Local (u, v)"""
-        n = dr.gather(mi.Vector3f, self.normals, spatial_indices)
-        frame = mi.Frame3f(n)
-        w_local = frame.to_local(directions)
-        cos_theta = dr.maximum(0.0, dr.minimum(1.0, w_local.z))
-        phi = dr.atan2(w_local.y, w_local.x)
-        phi = dr.select(phi < 0, phi + 2 * dr.pi, phi)
-        u_cont = (phi / (2 * dr.pi)) * self.res_u
-        u_idx = dr.minimum(mi.UInt32(u_cont), self.res_u - 1)
-        v_cont = cos_theta * self.res_v
-        v_idx = dr.minimum(mi.UInt32(v_cont), self.res_v - 1)
-        return v_idx * self.res_u + u_idx
-    
-    def nearest_point(self, positions):
-        """Trouve les indices des points les plus proches (Vectorisé)."""
-        n_queries = dr.width(positions)
-        min_dist2 = dr.full(mi.Float, 1e30, n_queries)
-        best_indices = dr.zeros(mi.UInt32, n_queries)
-        for i in range(self.n_points):
-            p_i = dr.gather(mi.Point3f, self.positions, i)
-            dist2 = dr.squared_norm(positions - p_i)
-            closer = dist2 < min_dist2
-            min_dist2 = dr.select(closer, dist2, min_dist2)
-            best_indices = dr.select(closer, mi.UInt32(i), best_indices)
-        return best_indices
+        w_l = mi.Frame3f(n).to_local(directions)
+        phi = dr.atan2(w_l.y, w_l.x)
+        u_idx = dr.minimum(mi.UInt32((phi / (2*dr.pi) + dr.select(phi < 0, 1.0, 0.0)) * self.res_u), self.res_u - 1)
+        v_idx = dr.minimum(mi.UInt32(dr.clip(w_l.z, 0.0, 1.0) * self.res_v), self.res_v - 1)
+        flat_idx = spatial_indices * self.n_bins_per_point + (v_idx * self.res_u + u_idx)
+        dr.scatter_reduce(dr.ReduceOp.Add, self.sum_r, rewards.x, flat_idx, active)
+        dr.scatter_reduce(dr.ReduceOp.Add, self.sum_g, rewards.y, flat_idx, active)
+        dr.scatter_reduce(dr.ReduceOp.Add, self.sum_b, rewards.z, flat_idx, active)
+        dr.scatter_reduce(dr.ReduceOp.Add, self.visit_counts, 1.0, flat_idx, active)
 
     def get_q_data(self, spatial_indices):
-        """Récupère les valeurs Q pour tous les bins."""
         all_q = []
         for i in range(self.n_bins_per_point):
-            flat_indices = spatial_indices * self.n_bins_per_point + i
-            val = dr.gather(mi.Float, self.sum_values, flat_indices)
-            count = dr.gather(mi.Float, self.visit_counts, flat_indices)
-            all_q.append(dr.select(count > 0, val / count, 0.0))
+            flat_idx = spatial_indices * self.n_bins_per_point + i
+            count = dr.maximum(dr.gather(mi.Float, self.visit_counts, flat_idx), 1.0)
+            all_q.append(mi.Color3f(dr.gather(mi.Float, self.sum_r, flat_idx) / count, dr.gather(mi.Float, self.sum_g, flat_idx) / count, dr.gather(mi.Float, self.sum_b, flat_idx) / count))
         return all_q
 
+    def get_q_sum(self, spatial_indices):
+        all_q, res = self.get_q_data(spatial_indices), mi.Color3f(0.0)
+        for i, q in enumerate(all_q): res += q * self.bin_cosines[i]
+        return mi.luminance(res)
+
     def sample_direction(self, spatial_indices, sample):
-        """Échantillonne une direction proportionnelle aux valeurs Q."""
-        n_queries = dr.width(spatial_indices)
-        all_q = self.get_q_data(spatial_indices)
-        q_sum = dr.zeros(mi.Float, n_queries)
-        for q in all_q: q_sum += q
-        
-        epsilon = 0.05 # Augmenté pour une exploration plus robuste au début
-        
-        # Calcul des poids avec protection contre les q_sum nuls ou très faibles
-        weights = [dr.select(q_sum > 1e-6, 
-                             (1.0 - epsilon) * q / q_sum + epsilon / self.n_bins_per_point, 
-                             1.0 / self.n_bins_per_point) for q in all_q]
-        
-        cum_weights = []
-        curr = dr.zeros(mi.Float, n_queries)
-        for w in weights:
-            curr += w
-            cum_weights.append(curr)
-        
-        u = sample.x
-        bin_idx = dr.zeros(mi.UInt32, n_queries)
-        for i in range(self.n_bins_per_point - 1):
-            bin_idx = dr.select(u > cum_weights[i], mi.UInt32(i + 1), bin_idx)
-        
-        v_idx, u_idx = bin_idx // self.res_u, bin_idx % self.res_u
-        
-        # Re-stratification de u pour l'échantillonnage à l'intérieur du bin
-        prev_c = dr.zeros(mi.Float, n_queries)
-        next_c = dr.zeros(mi.Float, n_queries)
-        for i in range(self.n_bins_per_point):
-            prev_c = dr.select(bin_idx == i, (cum_weights[i-1] if i > 0 else 0.0), prev_c)
-            next_c = dr.select(bin_idx == i, cum_weights[i], next_c)
-
-        u_local = (u - prev_c) / dr.maximum(next_c - prev_c, 1e-7)
-        u_local = dr.clamp(u_local, 0.0, 1.0)
-        
-        phi = (mi.Float(u_idx) + u_local) * (2 * dr.pi / self.res_u)
-        cos_theta = (mi.Float(v_idx) + sample.y) * (1.0 / self.res_v)
-        cos_theta = dr.clamp(cos_theta, 0.0, 1.0)
-        
+        all_q, epsilon = self.get_q_data(spatial_indices), 0.1
+        q_cos = [mi.luminance(q) * self.bin_cosines[i] for i, q in enumerate(all_q)]
+        q_sum = dr.zeros(mi.Float, dr.width(spatial_indices))
+        for val in q_cos: q_sum += val
+        weights = [dr.select(q_sum > 1e-6, (1.0 - epsilon) * q_c / q_sum + epsilon / self.n_bins_per_point, 1.0 / self.n_bins_per_point) for q_c in q_cos]
+        cum_w, curr = [], dr.zeros(mi.Float, dr.width(spatial_indices))
+        for w in weights: curr += w; cum_w.append(curr)
+        bin_idx = dr.zeros(mi.UInt32, dr.width(spatial_indices))
+        for i in range(self.n_bins_per_point - 1): bin_idx = dr.select(sample.x > cum_w[i], mi.UInt32(i + 1), bin_idx)
+        prev_c = dr.zeros(mi.Float, dr.width(spatial_indices))
+        for i in range(self.n_bins_per_point): prev_c = dr.select(bin_idx == i, (cum_w[i-1] if i > 0 else 0.0), prev_c)
+        u_l = dr.clip((sample.x - prev_c) / dr.maximum(dr.gather(mi.Float, dr.concat(cum_w), bin_idx) - prev_c, 1e-7), 0.0, 1.0)
+        phi, cos_theta = (mi.Float(bin_idx % self.res_u) + u_l) * (2 * dr.pi / self.res_u), dr.clip((mi.Float(bin_idx // self.res_u) + sample.y) / self.res_v, 0.0, 1.0)
         sin_theta = dr.safe_sqrt(1.0 - cos_theta * cos_theta)
-        w_local = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
-        
-        n = dr.gather(mi.Vector3f, self.normals, spatial_indices)
-        direction = mi.Frame3f(n).to_world(w_local)
-        
-        pdf = dr.zeros(mi.Float, n_queries)
-        for i in range(self.n_bins_per_point):
-            pdf = dr.select(bin_idx == i, weights[i], pdf)
-        pdf *= (self.n_bins_per_point / (2 * dr.pi))
-        
-        return direction, pdf
+        direction = mi.Frame3f(dr.gather(mi.Vector3f, self.normals, spatial_indices)).to_world(mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta))
+        pdf = dr.zeros(mi.Float, dr.width(spatial_indices))
+        for i in range(self.n_bins_per_point): pdf = dr.select(bin_idx == i, weights[i], pdf)
+        return direction, pdf * (self.n_bins_per_point / (2 * dr.pi))
 
-    def get_stats(self):
-        """Retourne des statistiques sur l'apprentissage."""
-        total_visits = dr.sum(self.visit_counts)[0]
-        max_q = dr.max(self.sum_values / dr.maximum(self.visit_counts, 1.0))[0]
-        mean_q = dr.sum(self.sum_values)[0] / dr.maximum(total_visits, 1.0)
-        return {
-            "total_visits": total_visits,
-            "max_q": max_q,
-            "mean_q": mean_q
-        }
+    def pdf_direction(self, spatial_indices, directions):
+        n = dr.gather(mi.Vector3f, self.normals, spatial_indices)
+        w_l = mi.Frame3f(n).to_local(directions)
+        phi = dr.atan2(w_l.y, w_l.x)
+        bin_idx = dr.minimum(mi.UInt32(dr.clip(w_l.z, 0.0, 1.0) * self.res_v), self.res_v - 1) * self.res_u + dr.minimum(mi.UInt32((phi / (2*dr.pi) + dr.select(phi < 0, 1.0, 0.0)) * self.res_u), self.res_u - 1)
+        all_q, epsilon = self.get_q_data(spatial_indices), 0.1
+        q_cos = [mi.luminance(q) * self.bin_cosines[i] for i, q in enumerate(all_q)]
+        q_sum = dr.zeros(mi.Float, dr.width(spatial_indices))
+        for val in q_cos: q_sum += val
+        pdf = dr.zeros(mi.Float, dr.width(spatial_indices))
+        for i in range(self.n_bins_per_point):
+            w = dr.select(q_sum > 1e-6, (1.0 - epsilon) * q_cos[i] / q_sum + epsilon / self.n_bins_per_point, 1.0 / self.n_bins_per_point)
+            pdf = dr.select(bin_idx == i, w, pdf)
+        return dr.select(w_l.z > 0, pdf * (self.n_bins_per_point / (2 * dr.pi)), 0.0)
 
     def compute_radiance_estimate(self, spatial_indices):
-        """Estime la radiance sortante diffuse via l'irradiance apprise."""
-        n_queries = dr.width(spatial_indices)
-        all_q = self.get_q_data(spatial_indices)
-        d_phi, d_cos = 2 * dr.pi / self.res_u, 1.0 / self.res_v
-        irradiance = dr.zeros(mi.Float, n_queries)
-        for i in range(self.n_bins_per_point):
-            cos_j = (mi.Float(i // self.res_u) + 0.5) / self.res_v
-            irradiance += all_q[i] * cos_j * d_phi * d_cos
-        return irradiance / dr.pi
+        all_q, res, d_omega = self.get_q_data(spatial_indices), mi.Color3f(0.0), (2 * dr.pi) / self.n_bins_per_point
+        for i, q in enumerate(all_q): res += q * self.bin_cosines[i] * d_omega
+        return res / dr.pi
 
+    def get_total_visits(self, spatial_indices):
+        total = dr.zeros(mi.Float, dr.width(spatial_indices))
+        for i in range(self.n_bins_per_point): total += dr.gather(mi.Float, self.visit_counts, spatial_indices * self.n_bins_per_point + i)
+        return total
+
+    def get_stats(self):
+        v = self.visit_counts
+        return {"total_visits": dr.sum(v)[0], "max_q": dr.max(self.sum_r/dr.maximum(v,1.0))[0], "mean_q": dr.sum(self.sum_r)[0]/dr.maximum(dr.sum(v)[0],1.0)}
 
 class DistributeSurfacePointsonScene:
-    def __init__(self, scene, n_points, resolution_u=8, resolution_v=8, ignore_source=True):
-        self.scene = scene
-        self.ignore_source = ignore_source
-        self.positions, self.normals = self._sample_points_on_scene(n_points)
-        self.irradiance_volume = SurfaceIrradianceVolume(self.positions, self.normals)
-
-    def _sample_points_on_scene(self, n_points):
-        shapes = self.scene.shapes()
-        
-        if self.ignore_source:
-            # On ne conserve que les objets qui ne sont pas des émetteurs de lumière
-            valid_shapes = [s for s in shapes if s.emitter() is None]
-            if len(valid_shapes) > 0:
-                shapes = valid_shapes
-
-        n_shapes = len(shapes)
-        if n_shapes == 0:
-            # Sécurité pour éviter un crash sur dr.concat si aucune forme n'est trouvée
-            return mi.Point3f(0.0), mi.Vector3f(0.0, 0.0, 1.0)
-
-        n_per_shape = max(1, n_points // n_shapes)
+    def __init__(self, scene, n_points):
+        shapes = [s for s in scene.shapes() if s.emitter() is None]
+        n_per = max(1, n_points // len(shapes))
         px, py, pz, nx, ny, nz = [], [], [], [], [], []
-        for i, shape in enumerate(shapes):
-            pcg = mi.PCG32(size=n_per_shape, initstate=i)
-            ps = shape.sample_position(0.0, mi.Point2f(pcg.next_float32(), pcg.next_float32()))
-            px.append(ps.p.x); py.append(ps.p.y); pz.append(ps.p.z)
-            nx.append(ps.n.x); ny.append(ps.n.y); nz.append(ps.n.z)
-            
-        return mi.Point3f(dr.concat(px), dr.concat(py), dr.concat(pz)), mi.Vector3f(dr.concat(nx), dr.concat(ny), dr.concat(nz))
-
-    def save(self, filename, radius=0.01, scale=1.0):
-        p_np = np.array(self.positions).T * scale
-        n_np = np.array(self.normals).T
-        n_probes = p_np.shape[0]
-        with open(filename, 'w') as f:
-            f.write(f"ply\nformat ascii 1.0\nelement vertex {2 * n_probes}\nproperty float x\nproperty float y\nproperty float z\nelement edge {n_probes}\nproperty int vertex1\nproperty int vertex2\nend_header\n")
-            for i in range(n_probes):
-                f.write(f"{p_np[i,0]} {p_np[i,1]} {p_np[i,2]}\n")
-                f.write(f"{p_np[i,0]+n_np[i,0]*radius*scale} {p_np[i,1]+n_np[i,1]*radius*scale} {p_np[i,2]+n_np[i,2]*radius*scale}\n")
-            for i in range(n_probes): f.write(f"{2*i} {2*i+1}\n")
-
+        for i, s in enumerate(shapes):
+            pcg = mi.PCG32(size=n_per, initstate=i)
+            ps = s.sample_position(0.0, mi.Point2f(pcg.next_float32(), pcg.next_float32()))
+            px.append(ps.p.x); py.append(ps.p.y); pz.append(ps.p.z); nx.append(ps.n.x); ny.append(ps.n.y); nz.append(ps.n.z)
+        self.irradiance_volume = SurfaceIrradianceVolume(scene, mi.Point3f(dr.concat(px), dr.concat(py), dr.concat(pz)), mi.Vector3f(dr.concat(nx), dr.concat(ny), dr.concat(nz)))
 
 class RLIntegrator(mi.SamplingIntegrator):
     def __init__(self, props=mi.Properties()):
         super().__init__(props)
-        self.n_probes = props.get('n_probes', 1000)
-        self.enable_guiding = props.get('enable_guiding', True)
-        self.update_q = props.get('update_q', True)
+        self.n_probes, self.enable_guiding, self.update_q = props.get('n_probes', 1000), props.get('enable_guiding', True), props.get('update_q', True)
         self.volume = None
 
     def sample(self, scene, sampler, ray, medium, active, update_q=True):
-        if self.enable_guiding and self.volume is None:
-             self.volume = DistributeSurfacePointsonScene(scene, self.n_probes).irradiance_volume
-
+        if self.enable_guiding and self.volume is None: self.volume = DistributeSurfacePointsonScene(scene, self.n_probes).irradiance_volume
         throughput, result = mi.Spectrum(1.0), mi.Spectrum(0.0)
-        prev_idx, prev_dir = dr.zeros(mi.UInt32, dr.width(active)), mi.Vector3f(0.0)
-        has_prev = dr.full(mi.Bool, False, dr.width(active))
-        depth = 0
-        
-        while dr.any(active) and depth < 5:
-            # Intersection with the scene
+        prev_idx, prev_dir, has_prev, depth = dr.zeros(mi.UInt32, dr.width(active)), mi.Vector3f(0.0), dr.full(mi.Bool, False, dr.width(active)), 0
+        while dr.any(active) and depth < 8:
             si = scene.ray_intersect(ray, active)
             active &= si.is_valid()
-
-            # Mise à jour de la valeur Q pour l'étape précédente
             if self.update_q and self.enable_guiding and dr.any(has_prev):
-                # On ne calcule la récompense que si l'intersection est valide
-                curr_idx = self.volume.nearest_point(si.p)
-                
-                # Récompense directe
-                emitter = si.emitter(scene)
-                has_emitter = si.is_valid() & (emitter != None)
-                L_direct = dr.select(has_emitter, mi.luminance(emitter.eval(si, has_emitter)), 0.0)
-                
-                # Récompense indirecte (estimation par le volume à l'intersection actuelle)
-                # On ne l'estime que si l'intersection est valide
-                albedo = dr.select(si.is_valid(), mi.luminance(si.bsdf().eval_diffuse_reflectance(si)), 0.0)
-                L_indirect = albedo * self.volume.compute_radiance_estimate(curr_idx)
-                
-                reward = L_direct + L_indirect
-                
-                # On met à jour le volume pour l'étape précédente (has_prev)
-                self.volume.update(prev_idx, prev_dir, reward, has_prev)
-
-            # Contribution directe des émetteurs    
-            emitter = si.emitter(scene)
-            has_emitter = active & (emitter != None)
-            if dr.any(has_emitter):
-                result += throughput * emitter.eval(si, has_emitter)
+                curr_idx, emitter = self.volume.nearest_point(si.p), si.emitter(scene)
+                L_dir = dr.select(si.is_valid() & (emitter != None), emitter.eval(si, si.is_valid()), 0.0)
+                L_ind = dr.select(si.is_valid() & (emitter == None), si.bsdf().eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx), 0.0)
+                self.volume.update(prev_idx, prev_dir, L_dir + L_ind, has_prev)
             
-            # Terminaison si aucune contribution n'est possible
+            # Next Event Estimation (NEE)
+            if dr.any(active):
+                bsdf = si.bsdf(ray)
+                emitter_sample, emitter_weight = scene.sample_emitter_direction(si, sampler.next_2d(active), True, active)
+                active_nee = active & (mi.luminance(emitter_weight) > 0)
+                if dr.any(active_nee):
+                    shadow_ray = si.spawn_ray_to(emitter_sample.p)
+                    occluded = scene.ray_test(shadow_ray, active_nee)
+                    result += dr.select(active_nee & ~occluded, throughput * emitter_weight * bsdf.eval(mi.BSDFContext(), si, si.to_local(emitter_sample.d), active_nee), 0.0)
+
+            if dr.any(active & (si.emitter(scene) != None)): result += throughput * si.emitter(scene).eval(si, active)
             if not dr.any(active): break
-
-            
-            bsdf = si.bsdf(ray)
-            ctx = mi.BSDFContext()
-
+            bsdf, ctx = si.bsdf(ray), mi.BSDFContext()
             if self.enable_guiding:
-                alpha = 0.8
                 curr_idx = self.volume.nearest_point(si.p)
-                
-                # Vérifier si la sonde est utilisable (même orientation que la surface)
-                probe_n = dr.gather(mi.Vector3f, self.volume.normals, curr_idx)
-                same_orientation = dr.dot(si.n, probe_n) > 0.1 # Seuil assoupli
-                
-                # Désactiver le guidage sur les surfaces trop lisses (Delta/Specular)
-                is_specular = (bsdf.flags() & int(mi.BSDFFlags.Delta)) != 0
-                active_guiding = active & ~is_specular & same_orientation
-                
-                # Choix de la stratégie (Guiding ou BSDF)
-                use_guiding = (sampler.next_1d(active) < alpha) & active_guiding
-                
-                # Échantillonnage selon les deux stratégies
-                wo_rl, pdf_rl_sample = self.volume.sample_direction(curr_idx, sampler.next_2d(active))
-                bs_sample, bs_weight = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
-                
-                # Convertir l'échantillon BSDF en coordonnées monde
-                wo_bsdf = si.to_world(bs_sample.wo)
-                
-                # Direction finale (monde)
-                direction = dr.select(use_guiding, wo_rl, wo_bsdf)
-                
-                # Direction locale pour les appels BSDF
-                wo_local = si.to_local(direction)
-                
-                # Calcul des PDFs pour le MIS (Multiple Importance Sampling)
-                pdf_rl = self.volume.pdf_direction(curr_idx, direction)
-                pdf_bsdf = bsdf.pdf(ctx, si, wo_local, active)
-                
-                # PDF combinée (Balance Heuristic)
-                pdf_mix = alpha * pdf_rl + (1.0 - alpha) * pdf_bsdf
-                
-                # Mise à jour du throughput avec le poids MIS
-                # Poids = f / pdf_mix
-                # Si use_guiding: energy = bsdf.eval * cos, throughput *= energy / pdf_mix
-                # Si ~use_guiding: direction est wo_bsdf, weight est bs_weight = (bsdf.eval * cos) / pdf_bsdf
-                # On veut multiplier par (bsdf.eval * cos) / pdf_mix
-                # Ce qui revient à multiplier par (bs_weight * pdf_bsdf) / pdf_mix
-                
-                energy = dr.select(use_guiding, 
-                                   bsdf.eval(ctx, si, wo_local, active) * dr.maximum(0.0, dr.dot(direction, si.n)), 
-                                   bs_weight * bs_sample.pdf)
-                
-                throughput *= dr.select(active_guiding, 
-                                        energy / dr.maximum(pdf_mix, 1e-7), 
-                                        bs_weight)
-                
-                prev_idx, prev_dir, has_prev = curr_idx, direction, active_guiding
+                alpha = dr.select((dr.dot(si.n, dr.gather(mi.Vector3f, self.volume.normals, curr_idx)) > 0.5) & (self.volume.get_q_sum(curr_idx) > 1e-4) & (self.volume.get_total_visits(curr_idx) > 100), 0.4, 0.0)
+                wo_rl, _ = self.volume.sample_direction(curr_idx, sampler.next_2d(active))
+                bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
+                direction = dr.select(sampler.next_1d(active) < alpha, wo_rl, si.to_world(bs_s.wo))
+                pdf_mix = alpha * self.volume.pdf_direction(curr_idx, direction) + (1.0 - alpha) * bsdf.pdf(ctx, si, si.to_local(direction), active)
+                throughput *= dr.select(alpha > 0, bsdf.eval(ctx, si, si.to_local(direction), active) * dr.maximum(0.0, dr.dot(direction, si.n)) / dr.maximum(pdf_mix, 1e-7), bs_w)
+                prev_idx, prev_dir, has_prev = curr_idx, direction, active
             else:
-                # Mode de contrôle : Path Tracing pur (seul le matériau décide)
-                bs_sample, bs_weight = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
-                direction = si.to_world(bs_sample.wo)
-                throughput *= bs_weight
-                has_prev = dr.full(mi.Bool, False, dr.width(active))
-
-            ray = si.spawn_ray(direction)
-            active &= dr.any(throughput != 0.0)
-            depth += 1
-            
+                bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
+                direction, throughput, has_prev = si.to_world(bs_s.wo), throughput * bs_w, dr.full(mi.Bool, False, dr.width(active))
+            ray, active, depth = si.spawn_ray(direction), active & dr.any(throughput != 0.0), depth + 1
         return result, active, []
 
 mi.register_integrator("rl_integrator", lambda props: RLIntegrator(props))
