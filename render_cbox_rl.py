@@ -39,14 +39,17 @@ class CornellBoxRenderer:
             "type": "rl_integrator",
             "n_probes": self.n_probes,
             "enable_guiding": guiding,
-            "update_q": update_q
+            "update_q": update_q,
+            "resolution_u": 8,
+            "resolution_v": 8,
+            "grid_res": 16
         }
         
         # Load the integrator
         integrator = mi.load_dict(integrator_dict)
 
         # Split SPP into multiple passes
-        n_passes = 8
+        n_passes = 64
         spp_per_pass = max(1, spp // n_passes)
         
         image = None
@@ -94,19 +97,19 @@ class CornellBoxRenderer:
 
 if __name__ == "__main__":
     # Create the renderer instance
-    renderer = CornellBoxRenderer(n_probes=1000)
+    renderer = CornellBoxRenderer(n_probes=64)
 
     # Run the rendering process
-    spp = 512
+    spp = 1024
 
     print("--- Rendering with Guided RL (Updating Q) ---")
     renderer.render(spp=spp, output_filename='render_result.png')
     
-    #print("\n--- Rendering with Guided RL (No Update) ---")
-    #renderer.render(spp=spp, update_q=False, output_filename='render_result_no_update.png')
+    print("\n--- Rendering with Guided RL (No Update) ---")
+    renderer.render(spp=spp, update_q=False, output_filename='render_result_no_update.png')
     
-    #print("\n--- Rendering with No Guiding ---")
-    #renderer.render(spp=spp, guiding=False, output_filename='render_result_no_guiding.png')
+    print("\n--- Rendering with No Guiding ---")
+    renderer.render(spp=spp, guiding=False, output_filename='render_result_no_guiding.png')
 
     print("\n--- Render with Mitsuba's default Path Tracer ---")
     renderer.mi_render(spp=spp, output_filename='render_result_mi.png')
