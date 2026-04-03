@@ -28,7 +28,10 @@ class SurfaceIrradianceVolume:
 
     def nearest_point(self, p):
         p_rel = (p - self.grid_min) / self.grid_size
-        idx = dr.clip(mi.UInt32(p_rel.z * self.grid_res), 0, self.grid_res - 1) * (self.grid_res**2) + dr.clip(mi.UInt32(p_rel.y * self.grid_res), 0, self.grid_res - 1) * self.grid_res + dr.clip(mi.UInt32(p_rel.x * self.grid_res), 0, self.grid_res - 1)
+        ix = dr.clip(mi.UInt32(p_rel.x * self.grid_res), 0, self.grid_res - 1)
+        iy = dr.clip(mi.UInt32(p_rel.y * self.grid_res), 0, self.grid_res - 1)
+        iz = dr.clip(mi.UInt32(p_rel.z * self.grid_res), 0, self.grid_res - 1)
+        idx = ix + iy * self.grid_res + iz * (self.grid_res**2)
         return dr.gather(mi.UInt32, self.grid_data, idx)
 
     def update(self, spatial_indices, directions, rewards, active):
