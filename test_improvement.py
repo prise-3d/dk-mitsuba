@@ -65,9 +65,8 @@ def test_learning_improvement(scene):
     # Final render for measurement
     img_guided = mi.render(scene, integrator=integrator_guided, spp=spp_test, seed=1)
 
-    integrator_guided.save_hemi_q_values('learned_q_values.ply')
+    integrator_guided.save_hemi_q_values('learned_q_values.ply')    
     
-
 
     mse_no_guiding = calculate_mse(img_no_guiding, img_ref)
     mse_guided = calculate_mse(img_guided, img_ref)
@@ -82,6 +81,10 @@ def test_learning_improvement(scene):
     mi.util.convert_to_bitmap(img_ref).write('test_ref.png')
     mi.util.convert_to_bitmap(img_no_guiding).write('test_no_guiding.png')
     mi.util.convert_to_bitmap(img_guided).write('test_guided.png')
+
+    # for validation save the 3d scene into a ply file
+    if integrator_guided.volume is not None:
+        integrator_guided.volume.save('scene_probes.ply')
 
     # According to user, this might fail currently
     assert mse_guided < mse_no_guiding
