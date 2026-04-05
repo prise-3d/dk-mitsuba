@@ -219,6 +219,7 @@ class DistributeSurfacePointsonScene:
             f.write("property float r\nproperty float g\nproperty float b\n")
             f.write(f"element face {n_points * n_bins}\n")
             f.write("property list uchar int vertex_indices\n")
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
             f.write("end_header\n")
 
             for i in range(n_points):
@@ -227,17 +228,18 @@ class DistributeSurfacePointsonScene:
                 frame = mi.Frame3f(n)
                 for j in range(n_bins):
                     u_idx, v_idx = j % res_u, j // res_u
+                    r, g, b = np.random.rand(3)
                     for du, dv in [(0, 0), (1, 0), (1, 1), (0, 1)]:
                         phi = (u_idx + du) * (2 * dr.pi / res_u)
                         cos_theta = dr.clip((v_idx + dv) / res_v, 0.0, 1.0)
                         sin_theta = dr.safe_sqrt(1.0 - cos_theta * cos_theta)
                         local_dir = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
                         v_pos = p + frame.to_world(local_dir) * radius
-                        r, g, b = np.random.rand(3)
                         f.write(f"{v_pos.x[0]} {v_pos.y[0]} {v_pos.z[0]} {r} {g} {b}\n")
 
             for i in range(n_points * n_bins):
-                f.write(f"4 {i*4} {i*4+1} {i*4+2} {i*4+3}\n")
+                r, g, b = np.random.rand(3)
+                f.write(f"4 {i*4} {i*4+1} {i*4+2} {i*4+3} {int(r*255)} {int(g*255)} {int(b*255)}\n")
 
 class RLIntegrator(mi.SamplingIntegrator):
     def __init__(self, props=mi.Properties()):
