@@ -205,6 +205,25 @@ class DistributeSurfacePointsonScene:
             for i in range(dr.width(self.positions)):
                 f.write(f"{pos[0, i]} {pos[1, i]} {pos[2, i]} {norm[0, i]} {norm[1, i]} {norm[2, i]}\n")
 
+    def save_hemi(self, path):
+        """Saves the hemisphere visualization of the learned Q-values for each point."""
+        with open(path, 'w') as f:
+            f.write(f"ply\nformat ascii 1.0\nelement vertex {self.irradiance_volume.n_points * self.irradiance_volume.n_bins_per_point}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("property float r\nproperty float g\nproperty float b\n")
+            f.write("end_header\n")
+            for i in range(self.irradiance_volume.n_points):
+                q_data = self.irradiance_volume.get_q_data(i)
+                n = dr.gather(mi.Vector3f, self.normals, i)
+                for j in range(self.irradiance_volume.n_bins_per_point):
+                    phi = (j % self.irradiance_volume.res_u + 0.5) * (2 * dr.pi / self.irradiance_volume.res_u)
+                    cos_theta = dr.clip((j // self.irradiance_volume.res_u + 0.5) / self.irradiance_volume.res_v, 0.0, 1.0)
+                    sin_theta = dr.safe_sqrt(1.0 - cos_theta * cos_theta)
+                    local_dir = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
+                    world_dir = mi.Frame3f(n).to_world(local_dir)
+                    r, g, b = q_data[j]
+                    f.write(f"{world_dir.x[0]} {world_dir.y[0]} {world_dir.z[0]} {r[0]} {g[0]} {b[0]}\n")
+
 class RLIntegrator(mi.SamplingIntegrator):
     def __init__(self, props=mi.Properties()):
         super().__init__(props)

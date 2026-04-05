@@ -151,6 +151,10 @@ def test_save_function():
     with open(output_path, 'r') as f:
         assert f.readline().strip() == "ply"
 
+    output_path_hemisphere = 'hemisphere_points.ply'
+    distrib.save_hemi(output_path_hemisphere)
+        
+
     if delete_files:
         os.remove(output_path)
 
