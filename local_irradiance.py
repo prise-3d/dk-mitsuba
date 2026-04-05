@@ -205,9 +205,9 @@ class DistributeSurfacePointsonScene:
             for i in range(dr.width(self.positions)):
                 f.write(f"{pos[0, i]} {pos[1, i]} {pos[2, i]} {norm[0, i]} {norm[1, i]} {norm[2, i]}\n")
 
-    def save_hemi(self, path):
+    def save_hemi(self, path, radius=10.0):
         """Saves the hemisphere visualization of the learned Q-values for each point."""
-        radius = 10.0
+        
         res_u, res_v = self.irradiance_volume.res_u, self.irradiance_volume.res_v
         n_bins = self.irradiance_volume.n_bins_per_point
         n_points = self.irradiance_volume.n_points
@@ -225,10 +225,12 @@ class DistributeSurfacePointsonScene:
             for i in range(n_points):
                 p = dr.gather(mi.Point3f, self.positions, i)
                 n = dr.gather(mi.Vector3f, self.normals, i)
+                q_list = self.irradiance_volume.get_q_data(i)
                 frame = mi.Frame3f(n)
                 for j in range(n_bins):
+                    q = q_list[j]
+                    r, g, b = q.x[0], q.y[0], q.z[0]
                     u_idx, v_idx = j % res_u, j // res_u
-                    r, g, b = np.random.rand(3)
                     for du, dv in [(0, 0), (1, 0), (1, 1), (0, 1)]:
                         phi = (u_idx + du) * (2 * dr.pi / res_u)
                         cos_theta = dr.clip((v_idx + dv) / res_v, 0.0, 1.0)
@@ -237,9 +239,13 @@ class DistributeSurfacePointsonScene:
                         v_pos = p + frame.to_world(local_dir) * radius
                         f.write(f"{v_pos.x[0]} {v_pos.y[0]} {v_pos.z[0]} {r} {g} {b}\n")
 
-            for i in range(n_points * n_bins):
-                r, g, b = np.random.rand(3)
-                f.write(f"4 {i*4} {i*4+1} {i*4+2} {i*4+3} {int(r*255)} {int(g*255)} {int(b*255)}\n")
+            for i in range(n_points):
+                q_list = self.irradiance_volume.get_q_data(i)
+                for j in range(n_bins):
+                    q = q_list[j]
+                    r, g, b = dr.clip(q.x[0], 0, 1), dr.clip(q.y[0], 0, 1), dr.clip(q.z[0], 0, 1)
+                    idx = i * n_bins + j
+                    f.write(f"4 {idx*4} {idx*4+1} {idx*4+2} {idx*4+3} {int(r*255)} {int(g*255)} {int(b*255)}\n")
 
 class RLIntegrator(mi.SamplingIntegrator):
     def __init__(self, props=mi.Properties()):
