@@ -207,12 +207,14 @@ class DistributeSurfacePointsonScene:
 
     def save_hemi(self, path):
         """Saves the hemisphere visualization of the learned Q-values for each point."""
+        radius = 0.1  # Increase this value to make the spheres larger
         with open(path, 'w') as f:
             f.write(f"ply\nformat ascii 1.0\nelement vertex {self.irradiance_volume.n_points * self.irradiance_volume.n_bins_per_point}\n")
             f.write("property float x\nproperty float y\nproperty float z\n")
             f.write("property float r\nproperty float g\nproperty float b\n")
             f.write("end_header\n")
             for i in range(self.irradiance_volume.n_points):
+                p = dr.gather(mi.Point3f, self.positions, i)
                 q_data = self.irradiance_volume.get_q_data(i)
                 n = dr.gather(mi.Vector3f, self.normals, i)
                 for j in range(self.irradiance_volume.n_bins_per_point):
@@ -221,8 +223,9 @@ class DistributeSurfacePointsonScene:
                     sin_theta = dr.safe_sqrt(1.0 - cos_theta * cos_theta)
                     local_dir = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
                     world_dir = mi.Frame3f(n).to_world(local_dir)
+                    v_pos = p + world_dir * radius
                     r, g, b = q_data[j]
-                    f.write(f"{world_dir.x[0]} {world_dir.y[0]} {world_dir.z[0]} {r[0]} {g[0]} {b[0]}\n")
+                    f.write(f"{v_pos.x[0]} {v_pos.y[0]} {v_pos.z[0]} {r[0]} {g[0]} {b[0]}\n")
 
 class RLIntegrator(mi.SamplingIntegrator):
     def __init__(self, props=mi.Properties()):
