@@ -181,36 +181,21 @@ class SurfaceIrradianceVolume:
         v = self.visit_counts
         return {"total_visits": dr.sum(v)[0], "max_q": dr.max(self.sum_r/dr.maximum(v,1.0))[0], "mean_q": dr.sum(self.sum_r)[0]/dr.maximum(dr.sum(v)[0],1.0)}
 
-class DistributeSurfacePointsonScene:
-    def __init__(self, scene, n_points, resolution_u=8, resolution_v=8, grid_res=16):
-        shapes = [s for s in scene.shapes() if s.emitter() is None]
-        n_per = max(1, n_points // len(shapes))
-        px, py, pz, nx, ny, nz = [], [], [], [], [], []
-        for i, s in enumerate(shapes):
-            pcg = mi.PCG32(size=n_per, initstate=i)
-            ps = s.sample_position(0.0, mi.Point2f(pcg.next_float32(), pcg.next_float32()))
-            px.append(ps.p.x); py.append(ps.p.y); pz.append(ps.p.z); nx.append(ps.n.x); ny.append(ps.n.y); nz.append(ps.n.z)
-        self.positions = mi.Point3f(dr.concat(px), dr.concat(py), dr.concat(pz))
-        self.normals = mi.Vector3f(dr.concat(nx), dr.concat(ny), dr.concat(nz))
-        self.irradiance_volume = SurfaceIrradianceVolume(scene, self.positions, self.normals, resolution_u, resolution_v, grid_res)
-
     def save(self, path):
         """Saves the sampled positions and normals to a PLY file for visualization."""
         pos, norm = np.array(self.positions), np.array(self.normals)
         with open(path, 'w') as f:
-            f.write(f"ply\nformat ascii 1.0\nelement vertex {dr.width(self.positions)}\n")
+            f.write(f"ply\nformat ascii 1.0\nelement vertex {self.n_points}\n")
             f.write("property float x\nproperty float y\nproperty float z\n")
             f.write("property float nx\nproperty float ny\nproperty float nz\n")
             f.write("end_header\n")
-            for i in range(dr.width(self.positions)):
+            for i in range(self.n_points):
                 f.write(f"{pos[0, i]} {pos[1, i]} {pos[2, i]} {norm[0, i]} {norm[1, i]} {norm[2, i]}\n")
 
     def save_hemi(self, path, radius=10.0):
         """Saves the hemisphere visualization of the learned Q-values for each point."""
-        
-        res_u, res_v = self.irradiance_volume.res_u, self.irradiance_volume.res_v
-        n_bins = self.irradiance_volume.n_bins_per_point
-        n_points = self.irradiance_volume.n_points
+        res_u, res_v = self.res_u, self.res_v
+        n_bins, n_points = self.n_bins_per_point, self.n_points
 
         with open(path, 'w') as f:
             f.write(f"ply\nformat ascii 1.0\n")
@@ -225,7 +210,7 @@ class DistributeSurfacePointsonScene:
             for i in range(n_points):
                 p = dr.gather(mi.Point3f, self.positions, i)
                 n = dr.gather(mi.Vector3f, self.normals, i)
-                q_list = self.irradiance_volume.get_q_data(i)
+                q_list = self.get_q_data(i)
                 frame = mi.Frame3f(n)
                 for j in range(n_bins):
                     q = q_list[j]
@@ -240,12 +225,32 @@ class DistributeSurfacePointsonScene:
                         f.write(f"{v_pos.x[0]} {v_pos.y[0]} {v_pos.z[0]} {r} {g} {b}\n")
 
             for i in range(n_points):
-                q_list = self.irradiance_volume.get_q_data(i)
+                q_list = self.get_q_data(i)
                 for j in range(n_bins):
                     q = q_list[j]
                     r, g, b = dr.clip(q.x[0], 0, 1), dr.clip(q.y[0], 0, 1), dr.clip(q.z[0], 0, 1)
                     idx = i * n_bins + j
                     f.write(f"4 {idx*4} {idx*4+1} {idx*4+2} {idx*4+3} {int(r*255)} {int(g*255)} {int(b*255)}\n")
+
+class DistributeSurfacePointsonScene:
+    def __init__(self, scene, n_points, resolution_u=8, resolution_v=8, grid_res=16):
+        shapes = [s for s in scene.shapes() if s.emitter() is None]
+        n_per = max(1, n_points // len(shapes))
+        px, py, pz, nx, ny, nz = [], [], [], [], [], []
+        for i, s in enumerate(shapes):
+            pcg = mi.PCG32(size=n_per, initstate=i)
+            ps = s.sample_position(0.0, mi.Point2f(pcg.next_float32(), pcg.next_float32()))
+            px.append(ps.p.x); py.append(ps.p.y); pz.append(ps.p.z); nx.append(ps.n.x); ny.append(ps.n.y); nz.append(ps.n.z)
+        self.positions = mi.Point3f(dr.concat(px), dr.concat(py), dr.concat(pz))
+        self.normals = mi.Vector3f(dr.concat(nx), dr.concat(ny), dr.concat(nz))
+        self.irradiance_volume = SurfaceIrradianceVolume(scene, self.positions, self.normals, resolution_u, resolution_v, grid_res)
+
+    def save(self, path):
+        self.irradiance_volume.save(path)
+
+    def save_hemi(self, path, radius=10.0):
+        self.irradiance_volume.save_hemi(path, radius)        
+
 
 class RLIntegrator(mi.SamplingIntegrator):
     def __init__(self, props=mi.Properties()):
@@ -256,7 +261,14 @@ class RLIntegrator(mi.SamplingIntegrator):
         self.volume = None
 
     def sample(self, scene, sampler, ray, medium, active, update_q=True):
-        if self.enable_guiding and self.volume is None: self.volume = DistributeSurfacePointsonScene(scene, self.n_probes, self.resolution_u, self.resolution_v, self.grid_res).irradiance_volume
+        if self.enable_guiding and self.volume is None:
+            distrib = DistributeSurfacePointsonScene(
+                scene, self.n_probes, 
+                self.resolution_u, self.resolution_v, 
+                self.grid_res
+            )
+            self.volume = distrib.irradiance_volume
+            
         throughput, result = mi.Spectrum(1.0), mi.Spectrum(0.0)
         prev_idx, prev_dir, has_prev, depth = dr.zeros(mi.UInt32, dr.width(active)), mi.Vector3f(0.0), dr.full(mi.Bool, False, dr.width(active)), 0
         while dr.any(active) and depth < 8:
@@ -295,5 +307,9 @@ class RLIntegrator(mi.SamplingIntegrator):
                 direction, throughput, has_prev = si.to_world(bs_s.wo), throughput * bs_w, dr.full(mi.Bool, False, dr.width(active))
             ray, active, depth = si.spawn_ray(direction), active & dr.any(throughput != 0.0), depth + 1
         return result, active, []
+    
+    def save_hemi_q_values(self, path):
+        if self.volume is not None:
+            self.volume.save_hemi(path)
 
 mi.register_integrator("rl_integrator", lambda props: RLIntegrator(props))
