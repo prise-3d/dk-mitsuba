@@ -207,25 +207,37 @@ class DistributeSurfacePointsonScene:
 
     def save_hemi(self, path):
         """Saves the hemisphere visualization of the learned Q-values for each point."""
-        radius = 10.0  # Increase this value to make the spheres larger
+        radius = 10.0
+        res_u, res_v = self.irradiance_volume.res_u, self.irradiance_volume.res_v
+        n_bins = self.irradiance_volume.n_bins_per_point
+        n_points = self.irradiance_volume.n_points
+
         with open(path, 'w') as f:
-            f.write(f"ply\nformat ascii 1.0\nelement vertex {self.irradiance_volume.n_points * self.irradiance_volume.n_bins_per_point}\n")
+            f.write(f"ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {n_points * n_bins * 4}\n")
             f.write("property float x\nproperty float y\nproperty float z\n")
             f.write("property float r\nproperty float g\nproperty float b\n")
+            f.write(f"element face {n_points * n_bins}\n")
+            f.write("property list uchar int vertex_indices\n")
             f.write("end_header\n")
-            for i in range(self.irradiance_volume.n_points):
+
+            for i in range(n_points):
                 p = dr.gather(mi.Point3f, self.positions, i)
-                q_data = self.irradiance_volume.get_q_data(i)
                 n = dr.gather(mi.Vector3f, self.normals, i)
-                for j in range(self.irradiance_volume.n_bins_per_point):
-                    phi = (j % self.irradiance_volume.res_u + 0.5) * (2 * dr.pi / self.irradiance_volume.res_u)
-                    cos_theta = dr.clip((j // self.irradiance_volume.res_u + 0.5) / self.irradiance_volume.res_v, 0.0, 1.0)
-                    sin_theta = dr.safe_sqrt(1.0 - cos_theta * cos_theta)
-                    local_dir = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
-                    world_dir = mi.Frame3f(n).to_world(local_dir)
-                    v_pos = p + world_dir * radius
-                    r, g, b = q_data[j]
-                    f.write(f"{v_pos.x[0]} {v_pos.y[0]} {v_pos.z[0]} {r[0]} {g[0]} {b[0]}\n")
+                frame = mi.Frame3f(n)
+                for j in range(n_bins):
+                    u_idx, v_idx = j % res_u, j // res_u
+                    for du, dv in [(0, 0), (1, 0), (1, 1), (0, 1)]:
+                        phi = (u_idx + du) * (2 * dr.pi / res_u)
+                        cos_theta = dr.clip((v_idx + dv) / res_v, 0.0, 1.0)
+                        sin_theta = dr.safe_sqrt(1.0 - cos_theta * cos_theta)
+                        local_dir = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
+                        v_pos = p + frame.to_world(local_dir) * radius
+                        r, g, b = np.random.rand(3)
+                        f.write(f"{v_pos.x[0]} {v_pos.y[0]} {v_pos.z[0]} {r} {g} {b}\n")
+
+            for i in range(n_points * n_bins):
+                f.write(f"4 {i*4} {i*4+1} {i*4+2} {i*4+3}\n")
 
 class RLIntegrator(mi.SamplingIntegrator):
     def __init__(self, props=mi.Properties()):
