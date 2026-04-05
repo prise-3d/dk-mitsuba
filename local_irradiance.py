@@ -236,7 +236,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                     occluded = scene.ray_test(shadow_ray, active_nee)
                     result += dr.select(active_nee & ~occluded, throughput * emitter_weight * bsdf.eval(mi.BSDFContext(), si, si.to_local(emitter_sample.d), active_nee), 0.0)
 
-            if dr.any(active & (si.emitter(scene) != None)): result += throughput * si.emitter(scene).eval(si, active)
+            if dr.any(active & (si.emitter(scene) != None)): result += dr.select(depth == 0, throughput * si.emitter(scene).eval(si, active), 0.0)
             if not dr.any(active): break
             bsdf, ctx = si.bsdf(ray), mi.BSDFContext()
             if self.enable_guiding:

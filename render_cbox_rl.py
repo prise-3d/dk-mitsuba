@@ -100,7 +100,7 @@ if __name__ == "__main__":
     renderer = CornellBoxRenderer(n_probes=64)
 
     # Run the rendering process
-    spp = 1024
+    spp = 128
 
     print("--- Rendering with Guided RL (Updating Q) ---")
     renderer.render(spp=spp, output_filename='render_result.png')
