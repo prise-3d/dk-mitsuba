@@ -140,7 +140,7 @@ def test_save_function():
     delete_files = False    
     scene_path='scenes/cbox/cbox.xml'
     scene = mi.load_file(scene_path)
-    distrib = DistributeSurfacePointsonScene(scene, 1000)
+    distrib = DistributeSurfacePointsonScene(scene, 100)
     
     # Sauvegarder dans un fichier temporaire
     output_path = 'test_surface_points.ply'

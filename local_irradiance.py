@@ -207,7 +207,7 @@ class DistributeSurfacePointsonScene:
 
     def save_hemi(self, path):
         """Saves the hemisphere visualization of the learned Q-values for each point."""
-        radius = 0.1  # Increase this value to make the spheres larger
+        radius = 10.0  # Increase this value to make the spheres larger
         with open(path, 'w') as f:
             f.write(f"ply\nformat ascii 1.0\nelement vertex {self.irradiance_volume.n_points * self.irradiance_volume.n_bins_per_point}\n")
             f.write("property float x\nproperty float y\nproperty float z\n")
