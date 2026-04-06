@@ -33,12 +33,26 @@ def test_learning_improvement(scene):
     Verifies if RL guiding reduces the error compared to classic Path Tracing.
     MSE(Guided, Ref) < MSE(NoGuiding, Ref)
     """
+    # 1. Récupérer la liste des formes de la scène
+    shapes = scene.shapes()
+
+    # 2. Boucler sur les formes et sauvegarder celles qui sont des maillages
+    for i, shape in enumerate(shapes):
+        # On vérifie si la shape a des données de maillage (vertices/faces)
+        if isinstance(shape, mi.Mesh):
+            filename = f"shape_{i}_{shape.id()}.ply"
+            shape.write_ply(filename)
+            print(f"Sauvegardé : {filename}")
+        else:
+            print(f"La shape {i} n'est pas un maillage (ex: sphère analytique), sautée.")
+
     print("\n=== Testing RL Guiding Improvement ===")
     spp_test = 64
     
     # 1. Reference (Ground Truth) - Moderate SPP Path Tracing
     print("\nRendering Reference (256 spp)...")
-    ref_integrator = mi.load_dict({"type": "path"})
+    ref_integrator = mi.load_dict({"type": "path"})    
+
     img_ref = mi.render(scene, integrator=ref_integrator, spp=256, seed=0)
     
     # 2. No Guiding - budget spp_test
@@ -83,8 +97,7 @@ def test_learning_improvement(scene):
     mi.util.convert_to_bitmap(img_guided).write('test_guided.png')
 
     # for validation save the 3d scene into a ply file
-    if integrator_guided.volume is not None:
-        integrator_guided.volume.save('scene_probes.ply')
+    
 
     # According to user, this might fail currently
     assert mse_guided < mse_no_guiding
