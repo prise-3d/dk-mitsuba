@@ -89,7 +89,7 @@ def test_nearest_point():
     query_point = (np.random.rand(3).astype(np.float32) * 2.0 - 1.0)
     
     # Calcul via Dr.Jit
-    found_idx = vol.nearest_point(mi.Point3f(query_point))
+    found_idx = vol.nearest_point(mi.Point3f(query_point), mi.Vector3f(0, 0, 1))
     
     # Calcul via Numpy (vérité terrain)
     dists = np.linalg.norm(pos_np - query_point, axis=1)
@@ -116,7 +116,7 @@ def test_nearest_point_exact():
     
     # Requête sur le point à [1, 1, 0] (index 3)
     query_point = mi.Point3f(1.0, 1.0, 0.0)
-    found_idx = vol.nearest_point(query_point)
+    found_idx = vol.nearest_point(query_point, mi.Vector3f(0, 0, 1))
     
     assert int(found_idx[0]) == 3
 

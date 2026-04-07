@@ -40,7 +40,7 @@ class CornellBoxRenderer:
             "n_probes": self.n_probes,
             "enable_guiding": guiding,
             "update_q": update_q,
-            "resolution_u": 8,
+            "resolution_u": 16,
             "resolution_v": 8,
             "grid_res": 16
         }

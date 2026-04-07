@@ -3,7 +3,19 @@ import mitsuba as mi
 import numpy as np
 
 class SurfaceIrradianceVolume:
+    """
+    A class that maintains a volume of irradiance estimates at sampled surface points in the scene,
+    discretized into directional bins, and provides methods for sampling directions based on learned Q-values.
+    """
     def __init__(self, scene, positions, normals, resolution_u=8, resolution_v=8, grid_res=16):
+        """
+        Initializes the SurfaceIrradianceVolume with the given scene, sampled positions, normals, and discretization parameters.
+        Input: - scene: The Mitsuba scene object.
+               - positions: A list of 3D positions on the scene surfaces where irradiance will be estimated.
+               - normals: The corresponding surface normals at the sampled positions.
+               - resolution_u, resolution_v: The angular resolution for the directional discretization (number of bins in azimuth and elevation).
+               - grid_res: The resolution of the spatial grid for efficient nearest neighbor queries when finding the closest surface point for a given ray intersection.
+        """
         self.positions, self.normals = mi.Point3f(positions), mi.Vector3f(normals)
         self.n_points = dr.width(self.positions)
         self.res_u, self.res_v, self.n_bins_per_point = resolution_u, resolution_v, resolution_u * resolution_v
@@ -16,6 +28,9 @@ class SurfaceIrradianceVolume:
         self._build_grid()
 
     def _build_grid(self):
+        """
+        Builds the spatial grid for efficient nearest neighbor queries.
+        """"
         res = self.grid_res
         idx = dr.arange(mi.UInt32, res**3)
         p = self.grid_min + self.grid_size * mi.Vector3f((mi.Float(idx % res) + 0.5) / res, (mi.Float((idx // res) % res) + 0.5) / res, (mi.Float(idx // (res * res)) + 0.5) / res)
@@ -26,7 +41,7 @@ class SurfaceIrradianceVolume:
             min_dist2, best_indices = dr.select(is_closer, d2, min_dist2), dr.select(is_closer, mi.UInt32(i), best_indices)
         self.grid_data = best_indices
 
-    def nearest_point(self, p, n):
+    def nearest_point(self, p, n):        
         """
         Finds the nearest surface point index for a given 3D position p and normal n.
         Restricts the search to points with a normal in the same direction (dot product > 0).
@@ -54,6 +69,13 @@ class SurfaceIrradianceVolume:
         return dr.select(is_aligned, grid_idx, fallback_idx)
 
     def update(self, spatial_indices, directions, rewards, active):
+        """
+        Updates the Q-values for the given spatial indices, directions, and rewards based on the observed samples.
+        Input: - spatial_indices: The indices of the surface points corresponding to the samples.
+               - directions: The world-space direction vectors of the samples.
+               - rewards: The observed rewards (radiance) for the samples, as a Color3f.
+               - active: A boolean mask indicating which samples are active and should be updated.
+        """   
         n = dr.gather(mi.Vector3f, self.normals, spatial_indices)
         w_l = mi.Frame3f(n).to_local(directions)
         phi = dr.atan2(w_l.y, w_l.x)
@@ -66,6 +88,9 @@ class SurfaceIrradianceVolume:
         dr.scatter_reduce(dr.ReduceOp.Add, self.visit_counts, 1.0, flat_idx, active)
 
     def get_q_data(self, spatial_indices):
+        """
+        Retrieves the Q-values for the given spatial indices.
+        """
         all_q = []
         for i in range(self.n_bins_per_point):
             flat_idx = spatial_indices * self.n_bins_per_point + i
@@ -74,6 +99,9 @@ class SurfaceIrradianceVolume:
         return all_q
 
     def get_q_sum(self, spatial_indices):
+        """
+        Computes the sum of Q-values across all bins for the given spatial indices, weighted by the cosine of the bin directions.
+        """
         all_q, res = self.get_q_data(spatial_indices), mi.Color3f(0.0)
         for i, q in enumerate(all_q): res += q * self.bin_cosines[i]
         return mi.luminance(res)
@@ -193,7 +221,8 @@ class SurfaceIrradianceVolume:
                 f.write(f"{pos[0, i]} {pos[1, i]} {pos[2, i]} {norm[0, i]} {norm[1, i]} {norm[2, i]}\n")
 
     def save_hemi(self, path, radius=10.0):
-        """Saves the hemisphere visualization of the learned Q-values for each point."""
+        """Saves the hemisphere visualization of the learned Q-values for each point.
+        uses the same PLY format but creates quads for each bin direction colored by the Q-values."""
         res_u, res_v = self.res_u, self.res_v
         n_bins, n_points = self.n_bins_per_point, self.n_points
 
@@ -206,6 +235,8 @@ class SurfaceIrradianceVolume:
             f.write("property list uchar int vertex_indices\n")
             f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
             f.write("end_header\n")
+
+            # Write vertices for each bin direction, colored by the Q-values
 
             for i in range(n_points):
                 p = dr.gather(mi.Point3f, self.positions, i)
@@ -224,6 +255,8 @@ class SurfaceIrradianceVolume:
                         v_pos = p + frame.to_world(local_dir) * radius
                         f.write(f"{v_pos.x[0]} {v_pos.y[0]} {v_pos.z[0]} {r} {g} {b}\n")
 
+            # Write faces for the quads                        
+
             for i in range(n_points):
                 q_list = self.get_q_data(i)
                 for j in range(n_bins):
@@ -233,7 +266,18 @@ class SurfaceIrradianceVolume:
                     f.write(f"4 {idx*4} {idx*4+1} {idx*4+2} {idx*4+3} {int(r*255)} {int(g*255)} {int(b*255)}\n")
 
 class DistributeSurfacePointsonScene:
+    """
+    Distributes a specified number of probes across the surfaces of the scene (excluding emitters) 
+    and constructs a SurfaceIrradianceVolume for RL-guided sampling.
+    """
     def __init__(self, scene, n_points, resolution_u=8, resolution_v=8, grid_res=16):
+        """
+        Initializes the distribution of surface points and constructs the irradiance volume.
+        Input: - scene: The Mitsuba scene object.
+               - n_points: The total number of probes to distribute across the scene surfaces.
+               - resolution_u, resolution_v: The angular resolution for the directional discretization.
+               - grid_res: The resolution of the spatial grid for nearest neighbor queries.
+        """
         shapes = [s for s in scene.shapes() if s.emitter() is None]
         n_per = max(1, n_points // len(shapes))
         px, py, pz, nx, ny, nz = [], [], [], [], [], []
@@ -246,14 +290,30 @@ class DistributeSurfacePointsonScene:
         self.irradiance_volume = SurfaceIrradianceVolume(scene, self.positions, self.normals, resolution_u, resolution_v, grid_res)
 
     def save(self, path):
+        """Saves the sampled surface points and normals to a PLY file for visualization."""
         self.irradiance_volume.save(path)
 
     def save_hemi(self, path, radius=10.0):
+        """Saves the hemisphere visualization of the learned Q-values for each point."""
         self.irradiance_volume.save_hemi(path, radius)        
 
 
 class RLIntegrator(mi.SamplingIntegrator):
+    """
+    A custom integrator that implements reinforcement learning-based guiding 
+    using a SurfaceIrradianceVolume.
+    """
+
     def __init__(self, props=mi.Properties()):
+        """Initializes the RLIntegrator with the given properties.
+        Input: - props: A Mitsuba Properties object containing configuration parameters for the integrator.
+        Expected properties include:
+        - n_probes: The number of probes to distribute across the scene surfaces for learning 
+        - enable_guiding: A boolean flag to enable or disable RL-guided sampling.
+        - update_q: A boolean flag to update the Q-values during sampling.
+        - resolution_u, resolution_v: The angular resolution for the directional discretization in the SurfaceIrradianceVolume.
+        - grid_res: The resolution of the spatial grid for nearest neighbor queries in the SurfaceIrradianceVolume.
+        """
         super().__init__(props)
         self.n_probes, self.enable_guiding, self.update_q = props.get('n_probes', 1000), props.get('enable_guiding', True), props.get('update_q', True)
         self.resolution_u, self.resolution_v = props.get('resolution_u', 8), props.get('resolution_v', 8)
@@ -261,6 +321,9 @@ class RLIntegrator(mi.SamplingIntegrator):
         self.volume = None
 
     def sample(self, scene, sampler, ray, medium, active, update_q=True):
+        """
+        Performs path tracing with optional RL-guided sampling and Q-value updates.
+        """
         if self.enable_guiding and self.volume is None:
             distrib = DistributeSurfacePointsonScene(
                 scene, self.n_probes, 
@@ -309,7 +372,13 @@ class RLIntegrator(mi.SamplingIntegrator):
         return result, active, []
     
     def save_hemi_q_values(self, path):
+        """Saves the hemisphere visualization of the learned Q-values for each point."""
+        if self.volume is not None:
+                self.volume.save_hemi(path)
         if self.volume is not None:
             self.volume.save_hemi(path)
 
+"""
+Registers the RLIntegrator with Mitsuba, allowing it to be used in scene descriptions and rendering.
+"""
 mi.register_integrator("rl_integrator", lambda props: RLIntegrator(props))

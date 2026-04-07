@@ -19,7 +19,7 @@ def scene():
         pytest.skip("Scene file not found")
     scene = mi.load_file(scene_path)
     # Very low res for fast tests
-    res = 32
+    res = 256
     params = mi.traverse(scene)
     for key in params.keys():
         if key.endswith('.film.size'):
@@ -69,7 +69,9 @@ def test_learning_improvement(scene):
         "type": "rl_integrator",
         "enable_guiding": True,
         "update_q": True,
-        "n_probes": 200
+        "n_probes": 200,
+        "resolution_u": 16,
+        "resolution_v": 8,
     })
     
     # Training passes (some passes to fill Q-values)
