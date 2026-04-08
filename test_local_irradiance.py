@@ -6,7 +6,7 @@ import drjit as dr
 import numpy as np
 import os
 import pytest
-from local_irradiance import SurfaceIrradianceVolume, DistributeSurfacePointsonScene
+from local_irradiance import SurfaceIrradianceVolume
 
 
 
@@ -125,13 +125,13 @@ def test_sample_points_on_scene():
     """Vérifie que la fonction de sampling génère le bon nombre de points et que les données sont cohérentes."""
     scene = mi.load_dict({'type': 'scene', 's': {'type': 'sphere'}})
     n_points = 50
-    distrib = DistributeSurfacePointsonScene(scene, n_points)
+    vol = SurfaceIrradianceVolume.from_scene(scene, n_points)
     
-    assert dr.width(distrib.positions) > 0
-    assert dr.width(distrib.normals) > 0
+    assert dr.width(vol.positions) > 0
+    assert dr.width(vol.normals) > 0
     
     # Vérifier que les normales sont unitaires
-    norms = np.linalg.norm(np.array(distrib.normals), axis=0)
+    norms = np.linalg.norm(np.array(vol.normals), axis=0)
     assert np.allclose(norms, 1.0)
 
 # test save function in DistrubuteSurfacePointsonScene
@@ -140,11 +140,11 @@ def test_save_function():
     delete_files = False    
     scene_path='scenes/cbox/cbox.xml'
     scene = mi.load_file(scene_path)
-    distrib = DistributeSurfacePointsonScene(scene, 100)
+    vol = SurfaceIrradianceVolume.from_scene(scene, 100)
     
     # Sauvegarder dans un fichier temporaire
     output_path = 'test_surface_points.ply'
-    distrib.save(output_path)
+    vol.save(output_path)
     
 
     assert os.path.exists(output_path)
@@ -152,7 +152,7 @@ def test_save_function():
         assert f.readline().strip() == "ply"
 
     output_path_hemisphere = 'hemisphere_points.ply'
-    distrib.save_hemi(output_path_hemisphere)
+    vol.save_hemi(output_path_hemisphere)
         
 
     if delete_files:

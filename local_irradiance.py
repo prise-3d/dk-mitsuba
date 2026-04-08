@@ -27,10 +27,29 @@ class SurfaceIrradianceVolume:
         self.grid_size = dr.maximum(self.grid_max - self.grid_min, 1e-4)
         self._build_grid()
 
+    @classmethod
+    def from_scene(cls, scene, n_points, resolution_u=8, resolution_v=8, grid_res=16):
+        """
+        Distributes a specified number of probes across the surfaces of the scene (excluding emitters) 
+        and constructs a SurfaceIrradianceVolume for RL-guided sampling.
+        """
+        shapes = [s for s in scene.shapes() if s.emitter() is None]
+        n_per = max(1, n_points // len(shapes))
+        px, py, pz, nx, ny, nz = [], [], [], [], [], []
+        for i, s in enumerate(shapes):
+            pcg = mi.PCG32(size=n_per, initstate=i)
+            ps = s.sample_position(0.0, mi.Point2f(pcg.next_float32(), pcg.next_float32()))
+            px.append(ps.p.x); py.append(ps.p.y); pz.append(ps.p.z); nx.append(ps.n.x); ny.append(ps.n.y); nz.append(ps.n.z)
+        
+        positions = mi.Point3f(dr.concat(px), dr.concat(py), dr.concat(pz))
+        normals = mi.Vector3f(dr.concat(nx), dr.concat(ny), dr.concat(nz))
+        
+        return cls(scene, positions, normals, resolution_u, resolution_v, grid_res)
+
     def _build_grid(self):
         """
         Builds the spatial grid for efficient nearest neighbor queries.
-        """"
+        """
         res = self.grid_res
         idx = dr.arange(mi.UInt32, res**3)
         p = self.grid_min + self.grid_size * mi.Vector3f((mi.Float(idx % res) + 0.5) / res, (mi.Float((idx // res) % res) + 0.5) / res, (mi.Float(idx // (res * res)) + 0.5) / res)
@@ -265,39 +284,6 @@ class SurfaceIrradianceVolume:
                     idx = i * n_bins + j
                     f.write(f"4 {idx*4} {idx*4+1} {idx*4+2} {idx*4+3} {int(r*255)} {int(g*255)} {int(b*255)}\n")
 
-class DistributeSurfacePointsonScene:
-    """
-    Distributes a specified number of probes across the surfaces of the scene (excluding emitters) 
-    and constructs a SurfaceIrradianceVolume for RL-guided sampling.
-    """
-    def __init__(self, scene, n_points, resolution_u=8, resolution_v=8, grid_res=16):
-        """
-        Initializes the distribution of surface points and constructs the irradiance volume.
-        Input: - scene: The Mitsuba scene object.
-               - n_points: The total number of probes to distribute across the scene surfaces.
-               - resolution_u, resolution_v: The angular resolution for the directional discretization.
-               - grid_res: The resolution of the spatial grid for nearest neighbor queries.
-        """
-        shapes = [s for s in scene.shapes() if s.emitter() is None]
-        n_per = max(1, n_points // len(shapes))
-        px, py, pz, nx, ny, nz = [], [], [], [], [], []
-        for i, s in enumerate(shapes):
-            pcg = mi.PCG32(size=n_per, initstate=i)
-            ps = s.sample_position(0.0, mi.Point2f(pcg.next_float32(), pcg.next_float32()))
-            px.append(ps.p.x); py.append(ps.p.y); pz.append(ps.p.z); nx.append(ps.n.x); ny.append(ps.n.y); nz.append(ps.n.z)
-        self.positions = mi.Point3f(dr.concat(px), dr.concat(py), dr.concat(pz))
-        self.normals = mi.Vector3f(dr.concat(nx), dr.concat(ny), dr.concat(nz))
-        self.irradiance_volume = SurfaceIrradianceVolume(scene, self.positions, self.normals, resolution_u, resolution_v, grid_res)
-
-    def save(self, path):
-        """Saves the sampled surface points and normals to a PLY file for visualization."""
-        self.irradiance_volume.save(path)
-
-    def save_hemi(self, path, radius=10.0):
-        """Saves the hemisphere visualization of the learned Q-values for each point."""
-        self.irradiance_volume.save_hemi(path, radius)        
-
-
 class RLIntegrator(mi.SamplingIntegrator):
     """
     A custom integrator that implements reinforcement learning-based guiding 
@@ -319,24 +305,27 @@ class RLIntegrator(mi.SamplingIntegrator):
         self.resolution_u, self.resolution_v = props.get('resolution_u', 8), props.get('resolution_v', 8)
         self.grid_res = props.get('grid_res', 16)
         self.volume = None
+        self.next_event_estimation = True
 
     def sample(self, scene, sampler, ray, medium, active, update_q=True):
         """
         Performs path tracing with optional RL-guided sampling and Q-value updates.
         """
         if self.enable_guiding and self.volume is None:
-            distrib = DistributeSurfacePointsonScene(
+            self.volume = SurfaceIrradianceVolume.from_scene(
                 scene, self.n_probes, 
                 self.resolution_u, self.resolution_v, 
                 self.grid_res
             )
-            self.volume = distrib.irradiance_volume
             
         throughput, result = mi.Spectrum(1.0), mi.Spectrum(0.0)
         prev_idx, prev_dir, has_prev, depth = dr.zeros(mi.UInt32, dr.width(active)), mi.Vector3f(0.0), dr.full(mi.Bool, False, dr.width(active)), 0
         while dr.any(active) and depth < 8:
             si = scene.ray_intersect(ray, active)
             active &= si.is_valid()
+
+            # if enabled, update the Q-values based on the previous action 
+            # and the observed radiance at the current intersection point
             if self.update_q and self.enable_guiding and dr.any(has_prev):
                 curr_idx, emitter = self.volume.nearest_point(si.p, si.n), si.emitter(scene)
                 L_dir = dr.select(si.is_valid() & (emitter != None), emitter.eval(si, si.is_valid()), 0.0)
@@ -344,7 +333,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                 self.volume.update(prev_idx, prev_dir, L_dir + L_ind, has_prev)
             
             # Next Event Estimation (NEE)
-            if dr.any(active):
+            if dr.any(active) and self.next_event_estimation:
                 bsdf = si.bsdf(ray)
                 emitter_sample, emitter_weight = scene.sample_emitter_direction(si, sampler.next_2d(active), True, active)
                 active_nee = active & (mi.luminance(emitter_weight) > 0)
@@ -354,9 +343,14 @@ class RLIntegrator(mi.SamplingIntegrator):
                     result += dr.select(active_nee & ~occluded, throughput * emitter_weight * bsdf.eval(mi.BSDFContext(), si, si.to_local(emitter_sample.d), active_nee), 0.0)
 
             if dr.any(active & (si.emitter(scene) != None)): result += dr.select(depth == 0, throughput * si.emitter(scene).eval(si, active), 0.0)
+        
+            # Early termination if no paths are active after this point
             if not dr.any(active): break
+
+            # Guided Sampling
             bsdf, ctx = si.bsdf(ray), mi.BSDFContext()
             if self.enable_guiding:
+                # find the closes
                 curr_idx = self.volume.nearest_point(si.p, si.n)
                 alpha = dr.select((dr.dot(si.n, dr.gather(mi.Vector3f, self.volume.normals, curr_idx)) > 0.0) & (self.volume.get_q_sum(curr_idx) > 1e-4) & (self.volume.get_total_visits(curr_idx) > 100), 0.4, 0.0)
                 wo_rl, _ = self.volume.sample_direction(curr_idx, sampler.next_2d(active))

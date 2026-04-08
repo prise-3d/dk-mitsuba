@@ -9,11 +9,11 @@ def check_normals():
         "type": "scene",
         "sphere": {"type": "sphere", "radius": 1.0}
     })
-    from local_irradiance import DistributeSurfacePointsonScene
-    distrib = DistributeSurfacePointsonScene(scene, 100)
+    from local_irradiance import SurfaceIrradianceVolume
+    vol = SurfaceIrradianceVolume.from_scene(scene, 100)
     
-    pos = np.array(distrib.positions)
-    norm = np.array(distrib.normals)
+    pos = np.array(vol.positions)
+    norm = np.array(vol.normals)
     
     # For a sphere at (0,0,0), dot(p, n) should be positive (1.0)
     dots = np.sum(pos * norm, axis=0)
