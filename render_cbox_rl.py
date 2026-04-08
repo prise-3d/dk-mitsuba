@@ -72,8 +72,9 @@ class CornellBoxRenderer:
         
         return image
     
-    def mi_render(self, integrator = mi.load_dict({"type": "path"}), spp=1024, res=256,
- output_filename='cbox_mi.png') :
+    def mi_render(self, integrator = mi.load_dict({"type": "path"}),
+                  spp=1024, res=256, 
+                  output_filename='cbox_mi.png') :
         """
         Renders the scene using Mitsuba's default Path Tracer.
         """
@@ -102,15 +103,21 @@ if __name__ == "__main__":
     # Run the rendering process
     spp = 128
 
+    format = "exr"
+    output_dir = "render_results"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    os.chdir(output_dir)
+
     print("--- Rendering with Guided RL (Updating Q) ---")
-    renderer.render(spp=spp, output_filename='render_result.png')
+    renderer.render(spp=spp, output_filename=f'render_result.{format}')
     
     print("\n--- Rendering with Guided RL (No Update) ---")
-    renderer.render(spp=spp, update_q=False, output_filename='render_result_no_update.png')
+    renderer.render(spp=spp, update_q=False, output_filename=f'render_result_no_update.{format}')
     
     print("\n--- Rendering with No Guiding ---")
-    renderer.render(spp=spp, guiding=False, output_filename='render_result_no_guiding.png')
+    renderer.render(spp=spp, guiding=False, output_filename=f'render_result_no_guiding.{format}')
 
     print("\n--- Render with Mitsuba's default Path Tracer ---")
-    renderer.mi_render(spp=spp, output_filename='render_result_mi.png')
+    renderer.mi_render(spp=spp, output_filename=f'render_result_mi.{format}')
     
