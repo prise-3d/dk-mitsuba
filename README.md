@@ -10,3 +10,23 @@ The main components of the code include:
 - A reinforcement learning agent that learns to sample light paths based on the rewards received from the rendering process.
 - A rendering loop that iteratively updates the agent's policy and renders the scene using the learned sampling strategy.
 
+# Dependency Installation
+To run the program, you will need to have Python installed along with the necessary dependencies, including mitsuba 3.
+
+ You can install the required dependencies using pip:
+```
+pip install mitsuba
+```
+
+# Usage
+To run the program, simply execute the main script:
+```
+python render_cbox_rl.py
+```
+
+You should obtain four images:
+- render_result: The final rendered image using the reinforcement learning method.
+- render_no_update: A reference image rendered using the same algorithm but without updating the policy, serving as a baseline for comparison.
+- render_no_guiding: A reference image rendered using a standard path tracing method without any guiding, serving as another baseline for comparison.
+- render_result_mi: An image rendered using the multiple importance sampling (MIS) technique, which is a common method for improving the efficiency of path tracing.
+
