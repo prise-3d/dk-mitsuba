@@ -11,7 +11,9 @@ from local_irradiance import SurfaceIrradianceVolume
 
 
 def test_initialization():
-    """Vérifie que la structure est bien initialisée avec les bonnes dimensions."""
+    """
+    check that the structure is initialized with the correct dimensions.
+    """
     n_points = 5
     positions = np.zeros((3, n_points), dtype=np.float32)
     normals = np.zeros((3, n_points), dtype=np.float32)
@@ -31,7 +33,10 @@ def test_initialization():
     assert dr.all(vol.visit_counts == 0)[0]
 
 def test_update_and_query_averaging():
-    """Vérifie que les mises à jour accumulent correctement et calculent la moyenne."""
+    """
+    Check that updates correctly accumulate and average the irradiance values.
+    """
+    
     positions = mi.Point3f([0], [0], [0])
     normals = mi.Vector3f([0], [0], [1])
     scene = mi.load_dict({'type': 'scene', 's': {'type': 'sphere'}})
@@ -41,19 +46,19 @@ def test_update_and_query_averaging():
     direction = mi.Vector3f([0], [0], [1])
     active = mi.Bool([True])
     
-    # Premier update
+    # first update
     vol.update(idx, direction, mi.Color3f(10.0), active)
     q_data = vol.get_q_data(idx)
     # For normal direction (0,0,1) and 2x2 resolution, flat_idx calculation results in bin 2
     assert dr.allclose(q_data[2], 10.0)
     
-    # Deuxième update (même bin)
+    # second update (same bin)
     vol.update(idx, direction, mi.Color3f(20.0), active)
     q_data = vol.get_q_data(idx)
     assert dr.allclose(q_data[2], 15.0) # (10 + 20) / 2
 
 def test_directional_bins():
-    """Vérifie que des directions différentes tombent dans des bins différents."""
+    """Check that different directions fall into different bins."""
     positions = mi.Point3f([0], [0], [0])
     normals = mi.Vector3f([0], [0], [1])
     scene = mi.load_dict({'type': 'scene', 's': {'type': 'sphere'}})
@@ -75,34 +80,34 @@ def test_directional_bins():
     assert dr.allclose(q_side, 0.0)
 
 def test_nearest_point():
-    """Vérifie que nearest_point trouve bien le point le plus proche (comparaison avec numpy)."""
+    """Check that nearest_point finds the closest point (comparison with numpy)."""
     n_points = 10
-    # On génère des points dans [-1, 1] pour correspondre à la BBox de la sphère par défaut
+    # We generate points in [-1, 1] to match the BBox of the default sphere
     pos_np = (np.random.rand(n_points, 3).astype(np.float32) * 2.0 - 1.0)
     norm_np = np.tile([0, 0, 1], (n_points, 1)).astype(np.float32)
     
     scene = mi.load_dict({'type': 'scene', 's': {'type': 'sphere'}})
-    # On augmente grid_res pour minimiser l'erreur de discrétisation pendant le test
+    # We increase grid_res to minimize discretization error during the test
     vol = SurfaceIrradianceVolume(scene, pos_np.T, norm_np.T, grid_res=32)
     
-    # Point de requête aléatoire
+    # We query a random point and check that the found point is close to the expected nearest point
     query_point = (np.random.rand(3).astype(np.float32) * 2.0 - 1.0)
     
-    # Calcul via Dr.Jit
+    # Compute via Dr.Jit
     found_idx = vol.nearest_point(mi.Point3f(query_point), mi.Vector3f(0, 0, 1))
     
-    # Calcul via Numpy (vérité terrain)
+    # Calculate via Numpy (truth)
     dists = np.linalg.norm(pos_np - query_point, axis=1)
     expected_idx = np.argmin(dists)
-    
-    # On vérifie que la distance du point trouvé est proche de la distance minimale
+        
+    # check that the found point is within a reasonable distance of the expected nearest point (considering grid discretization)
     dist_found = np.linalg.norm(pos_np[found_idx] - query_point)
     dist_expected = dists[expected_idx]
     
-    assert dist_found <= dist_expected + 0.2  # Marge d'erreur due à la grille
+    assert dist_found <= dist_expected + 0.2  # error margin due to the grid (?)
 
 def test_nearest_point_exact():
-    """Vérifie que si on cherche un point qui existe, on le trouve."""
+    """Check that if we search for a point that exists, we find it."""
     pos_np = np.array([
         [0, 0, 0],
         [1, 0, 0],
@@ -122,7 +127,7 @@ def test_nearest_point_exact():
 
 # test sample_points_on_scene
 def test_sample_points_on_scene():
-    """Vérifie que la fonction de sampling génère le bon nombre de points et que les données sont cohérentes."""
+    """Check that the sampling function generates the correct number of points and that the data is consistent."""
     scene = mi.load_dict({'type': 'scene', 's': {'type': 'sphere'}})
     n_points = 50
     vol = SurfaceIrradianceVolume.from_scene(scene, n_points)
@@ -130,13 +135,13 @@ def test_sample_points_on_scene():
     assert dr.width(vol.positions) > 0
     assert dr.width(vol.normals) > 0
     
-    # Vérifier que les normales sont unitaires
+    # Check that the normals are unit vectors
     norms = np.linalg.norm(np.array(vol.normals), axis=0)
     assert np.allclose(norms, 1.0)
 
 # test save function in DistrubuteSurfacePointsonScene
 def test_save_function():
-    """Vérifie que la fonction de sauvegarde crée un fichier avec les bonnes données."""
+    """Check that the save function creates a file with the correct data."""
     delete_files = False    
     scene_path='scenes/cbox/cbox.xml'
     scene = mi.load_file(scene_path)
