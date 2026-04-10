@@ -26,7 +26,7 @@ class CornellBoxRenderer:
         print(f"Starting render with RLIntegrator ({self.n_probes} probes, {spp} spp)...")
         
         # Change resolution dynamically
-        res = 256
+        res = 16
         params = mi.traverse(self.scene)
         for key in params.keys():
             if key.endswith('.film.size'):
@@ -49,7 +49,7 @@ class CornellBoxRenderer:
         integrator = mi.load_dict(integrator_dict)
 
         # Split SPP into multiple passes
-        n_passes = 64
+        n_passes = 2
         spp_per_pass = max(1, spp // n_passes)
         
         image = None
@@ -65,9 +65,11 @@ class CornellBoxRenderer:
                 stats = integrator.volume.get_stats()
                 print(f"    Stats: visits={stats['total_visits']:.0f}, mean_q={stats['mean_q']:.4f}, max_q={stats['max_q']:.4f}")
 
-        # Convert to sRGB and write to PNG
-        bitmap = mi.util.convert_to_bitmap(image)
-        bitmap.write(output_filename)
+        # Save the image. For EXR, we keep raw float data. For others, we convert to sRGB.
+        if output_filename.lower().endswith('.exr'):
+            mi.Bitmap(image).write(output_filename)
+        else:
+            mi.util.convert_to_bitmap(image).write(output_filename)
         print(f"Render completed. Image saved to: {output_filename}")
         
         return image
@@ -88,10 +90,12 @@ class CornellBoxRenderer:
                 params.update()
                 break
 
-        ref_integrator = mi.load_dict({"type": "path"})
-        img_ref = mi.render(self.scene, integrator=ref_integrator, spp=spp)
-        bitmap = mi.util.convert_to_bitmap(img_ref)
-        bitmap.write(output_filename)
+        img_ref = mi.render(self.scene, integrator=mi.load_dict({"type": "path"}), spp=spp)
+        
+        if output_filename.lower().endswith('.exr'):
+            mi.Bitmap(img_ref).write(output_filename)
+        else:
+            mi.util.convert_to_bitmap(img_ref).write(output_filename)
         print(f"Render completed. Image saved to: {output_filename}")
 
     
@@ -101,7 +105,7 @@ if __name__ == "__main__":
     renderer = CornellBoxRenderer(n_probes=64)
 
     # Run the rendering process
-    spp = 128
+    spp = 16
 
     format = "exr"
     output_dir = "render_results"

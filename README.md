@@ -30,3 +30,17 @@ You should obtain four images:
 - render_no_guiding: A reference image rendered using a standard path tracing method without any guiding, serving as another baseline for comparison.
 - render_result_mi: An image rendered using the multiple importance sampling (MIS) technique, which is a common method for improving the efficiency of path tracing.
 
+# Testing
+
+Several test cases are available to validate the proper functioning of the program.
+
+Run for example:
+```pytest test_local_irradiance.py```
+or
+```python -m pytest test_local_irradiance.py```
+
+- test_local_irradiance.py: This test case checks the correctness of the local irradiance estimation.
+
+
+
+
