@@ -76,7 +76,7 @@ def test_learning_improvement(scene):
     
     # Training passes (some passes to fill Q-values)
     for i in range(5):
-        mi.render(scene, integrator=integrator_guided, spp=8, seed=i+10)
+        mi.render(scene, integrator=integrator_guided, spp=4, seed=i+10)
     
     # Final render for measurement
     img_guided = mi.render(scene, integrator=integrator_guided, spp=spp_test, seed=1)

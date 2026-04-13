@@ -11,7 +11,7 @@ class CornellBoxRenderer:
     """
     A class to handle rendering the Cornell Box using the reinforcement learning integrator.
     """
-    def __init__(self, scene_path='scenes/cbox/cbox.xml', n_probes=1000):
+    def __init__(self, scene_path='scenes/cbox/cbox.xml', n_probes=1024):
         if not os.path.exists(scene_path):
             raise FileNotFoundError(f"Scene file not found: {scene_path}")
         
@@ -26,7 +26,7 @@ class CornellBoxRenderer:
         print(f"Starting render with RLIntegrator ({self.n_probes} probes, {spp} spp)...")
         
         # Change resolution dynamically
-        res = 16
+        res = 256  
         params = mi.traverse(self.scene)
         for key in params.keys():
             if key.endswith('.film.size'):
@@ -49,7 +49,7 @@ class CornellBoxRenderer:
         integrator = mi.load_dict(integrator_dict)
 
         # Split SPP into multiple passes
-        n_passes = 2
+        n_passes = 16
         spp_per_pass = max(1, spp // n_passes)
         
         image = None
@@ -102,10 +102,10 @@ class CornellBoxRenderer:
 
 if __name__ == "__main__":
     # Create the renderer instance
-    renderer = CornellBoxRenderer(n_probes=64)
+    renderer = CornellBoxRenderer(n_probes=1024)
 
     # Run the rendering process
-    spp = 16
+    spp = 32
 
     format = "exr"
     output_dir = "render_results"
