@@ -357,7 +357,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
                 direction = dr.select(sampler.next_1d(active) < alpha, wo_rl, si.to_world(bs_s.wo))
                 pdf_mix = alpha * self.volume.pdf_direction(curr_idx, direction) + (1.0 - alpha) * bsdf.pdf(ctx, si, si.to_local(direction), active)
-                throughput *= dr.select(alpha > 0, bsdf.eval(ctx, si, si.to_local(direction), active) * dr.maximum(0.0, dr.dot(direction, si.n)) / dr.maximum(pdf_mix, 1e-7), bs_w)
+                throughput *= dr.select(alpha > 0, bsdf.eval(ctx, si, si.to_local(direction), active) / dr.maximum(pdf_mix, 1e-7), bs_w)
                 prev_idx, prev_dir, has_prev = curr_idx, direction, active
             else:
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
