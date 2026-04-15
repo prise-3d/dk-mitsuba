@@ -305,7 +305,7 @@ class RLIntegrator(mi.SamplingIntegrator):
         self.resolution_u, self.resolution_v = props.get('resolution_u', 8), props.get('resolution_v', 8)
         self.grid_res = props.get('grid_res', 16)
         self.volume = None
-        self.next_event_estimation = False
+        self.next_event_estimation = True
 
     def sample(self, scene, sampler, ray, medium, active, update_q=True):
         """
@@ -328,49 +328,50 @@ class RLIntegrator(mi.SamplingIntegrator):
             bsdf = si.bsdf(ray)
             ctx = mi.BSDFContext()
 
-            # Compute current probe index once for both update and sampling
-            curr_idx = self.volume.nearest_point(si.p, si.n) if self.enable_guiding else dr.zeros(mi.UInt32, dr.width(active))
-
             # Next Event Estimation (NEE)
             if dr.any(active) and self.next_event_estimation:
                 emitter_sample, emitter_weight = scene.sample_emitter_direction(si, sampler.next_2d(active), True, active)
                 active_nee = active & (mi.luminance(emitter_weight) > 0)
                 if dr.any(active_nee):
                     wo_nee = si.to_local(emitter_sample.d)
+                    # CRITIQUE : Le cosinus local est obligatoire ici
                     cos_nee = dr.maximum(0.0, wo_nee.z)
                     shadow_ray = si.spawn_ray_to(emitter_sample.p)
                     occluded = scene.ray_test(shadow_ray, active_nee)
                     nee_contrib_val = dr.select(active_nee & ~occluded, emitter_weight * bsdf.eval(ctx, si, wo_nee, active_nee) * cos_nee, 0.0)
                     result += throughput * nee_contrib_val
 
-            # Update Q-values using the radiance observed at the CURRENT hit point to reward the PREVIOUS probe/direction
+            # if enabled, update the Q-values based on the previous action 
+            # and the observed radiance (Direct + NEE + Indirect)
             if self.update_q and self.enable_guiding and dr.any(has_prev):
                 active_up = has_prev & si.is_valid()
-                emitter = si.emitter(scene, active_up)
+                curr_idx, emitter = self.volume.nearest_point(si.p, si.n), si.emitter(scene, active_up)
                 L_dir = dr.select(emitter != None, emitter.eval(si, active_up), 0.0)
                 L_ind = dr.select(emitter == None, bsdf.eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx), 0.0)
+                # Le reward est la radiance sortante de si (émise + réfléchie)
                 self.volume.update(prev_idx, prev_dir, L_dir + nee_contrib_val + L_ind, active_up)
 
-            if dr.any(active & (si.emitter(scene) != None)): result += dr.select(depth == 0, throughput * si.emitter(scene).eval(si, active), 0.0)
+            emitter_hit = si.emitter(scene, active)
+            if dr.any(active & (emitter_hit != None)): result += throughput * emitter_hit.eval(si, active)
         
             if not dr.any(active): break
 
             # Guided Sampling
             if self.enable_guiding:
-                # Guiding probability (alpha). Even if alpha=0, we still learn from the BSDF sample.
-                alpha = dr.select((dr.dot(si.n, dr.gather(mi.Vector3f, self.volume.normals, curr_idx)) > 0.0) & (self.volume.get_q_sum(curr_idx) > 1e-4) & (self.volume.get_total_visits(curr_idx) > 50), 0.4, 0.0)
+                curr_idx = self.volume.nearest_point(si.p, si.n)
+                # On ne guide que si on a assez de données (visites > 100)
+                alpha = dr.select((dr.dot(si.n, dr.gather(mi.Vector3f, self.volume.normals, curr_idx)) > 0.0) & (self.volume.get_q_sum(curr_idx) > 1e-4) & (self.volume.get_total_visits(curr_idx) > 100), 0.4, 0.0)
                 wo_rl, _ = self.volume.sample_direction(curr_idx, sampler.next_2d(active))
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
                 direction = dr.select(sampler.next_1d(active) < alpha, wo_rl, si.to_world(bs_s.wo))
                 wo_local = si.to_local(direction)
                 pdf_mix = alpha * self.volume.pdf_direction(curr_idx, direction) + (1.0 - alpha) * bsdf.pdf(ctx, si, wo_local, active)
+                # On utilise la formule f*cos/pdf_mix. Si alpha=0, on retombe exactement sur bs_w.
                 throughput *= dr.select(alpha > 0, bsdf.eval(ctx, si, wo_local, active) * dr.maximum(0.0, wo_local.z) / dr.maximum(pdf_mix, 1e-7), bs_w)
-                # CRUCIAL: Always update tracking variables to allow learning even if alpha is 0
-                prev_idx, prev_dir, has_prev = curr_idx, direction, active & (dr.any(throughput > 0.0))
+                prev_idx, prev_dir, has_prev = curr_idx, direction, active
             else:
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
                 direction, throughput, has_prev = si.to_world(bs_s.wo), throughput * bs_w, dr.full(mi.Bool, False, dr.width(active))
-
             ray, active, depth = si.spawn_ray(direction), active & dr.any(throughput != 0.0), depth + 1
         return result, active, []
     
