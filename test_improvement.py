@@ -70,7 +70,7 @@ def test_learning_improvement(scene):
         "enable_guiding": True,
         "update_q": True,
         "n_probes": 200,
-        "resolution_u": 16,
+        "resolution_u": 8,
         "resolution_v": 8,
     })
     
