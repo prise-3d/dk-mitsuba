@@ -356,22 +356,37 @@ class RLIntegrator(mi.SamplingIntegrator):
         
             if not dr.any(active): break
 
-            # Guided Sampling
+            # --- Guided Sampling with Robust MIS ---
             if self.enable_guiding:
                 curr_idx = self.volume.nearest_point(si.p, si.n)
-                # On ne guide que si on a assez de données (visites > 100)
-                alpha = dr.select((dr.dot(si.n, dr.gather(mi.Vector3f, self.volume.normals, curr_idx)) > 0.0) & (self.volume.get_q_sum(curr_idx) > 1e-4) & (self.volume.get_total_visits(curr_idx) > 100), 0.4, 0.0)
+                
+                # Probabilité de guidage (alpha)
+                # On vérifie l'alignement des normales pour éviter le guidage "à travers" les murs
+                dot_n = dr.dot(si.n, dr.gather(mi.Vector3f, self.volume.normals, curr_idx))
+                alpha = dr.select((dot_n > 0.5) & (self.volume.get_total_visits(curr_idx) > 50), 0.4, 0.0)
+                
+                # Tirage de la direction (RL ou BSDF)
                 wo_rl, _ = self.volume.sample_direction(curr_idx, sampler.next_2d(active))
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
+                
                 direction = dr.select(sampler.next_1d(active) < alpha, wo_rl, si.to_world(bs_s.wo))
                 wo_local = si.to_local(direction)
-                pdf_mix = alpha * self.volume.pdf_direction(curr_idx, direction) + (1.0 - alpha) * bsdf.pdf(ctx, si, wo_local, active)
-                # On utilise la formule f*cos/pdf_mix. Si alpha=0, on retombe exactement sur bs_w.
-                throughput *= dr.select(alpha > 0, bsdf.eval(ctx, si, wo_local, active) * dr.maximum(0.0, wo_local.z) / dr.maximum(pdf_mix, 1e-7), bs_w)
-                prev_idx, prev_dir, has_prev = curr_idx, direction, active
+                
+                # Calcul du PDF combiné (MIS)
+                # Important : le PDF de la BSDF doit être évalué sur la direction finale
+                pdf_bsdf = bsdf.pdf(ctx, si, wo_local, active)
+                pdf_rl = self.volume.pdf_direction(curr_idx, direction)
+                pdf_mix = alpha * pdf_rl + (1.0 - alpha) * pdf_bsdf
+                
+                # Mise à jour du throughput (f * cos / pdf_mix)
+                weight = dr.select(pdf_mix > 1e-7, (bsdf.eval(ctx, si, wo_local, active) * dr.maximum(0.0, wo_local.z)) / pdf_mix, 0.0)
+                throughput *= dr.select(alpha > 0, weight, bs_w)
+                
+                prev_idx, prev_dir, has_prev = curr_idx, direction, active & (dr.any(throughput > 0.0))
             else:
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
                 direction, throughput, has_prev = si.to_world(bs_s.wo), throughput * bs_w, dr.full(mi.Bool, False, dr.width(active))
+
             ray, active, depth = si.spawn_ray(direction), active & dr.any(throughput != 0.0), depth + 1
         return result, active, []
     
