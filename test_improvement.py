@@ -3,6 +3,7 @@ import drjit as dr
 import numpy as np
 import pytest
 import os
+import time
 
 # Ensure we are in a supported variant
 mi.set_variant('llvm_ad_rgb')
@@ -53,7 +54,9 @@ def test_learning_improvement(scene):
     print("\nRendering Reference (256 spp)...")
     ref_integrator = mi.load_dict({"type": "path"})    
 
+    start_time = time.perf_counter()
     img_ref = mi.render(scene, integrator=ref_integrator, spp=256, seed=0)
+    ref_time = time.perf_counter() - start_time
     
     # No Guiding - budget spp_test
     print(f"Rendering No Guiding ({spp_test} spp)...")
@@ -61,7 +64,9 @@ def test_learning_improvement(scene):
         "type": "rl_integrator",
         "enable_guiding": False
     })
+    start_time = time.perf_counter()
     img_no_guiding = mi.render(scene, integrator=integrator_no_guiding, spp=spp_test, seed=1)
+    no_guiding_time = time.perf_counter() - start_time
     
     # Guided RL - same spp_test budget, but with guiding enabled
     print(f"Training and Rendering Guided RL ({spp_test} spp)...")
@@ -75,18 +80,29 @@ def test_learning_improvement(scene):
     })
     
     # Training passes (some passes to fill Q-values)
+    start_time = time.perf_counter()
     for i in range(5):
         mi.render(scene, integrator=integrator_guided, spp=4, seed=i+10)
+    training_time = time.perf_counter() - start_time
     
     # Final render for measurement
+    start_time = time.perf_counter()
     img_guided = mi.render(scene, integrator=integrator_guided, spp=spp_test, seed=1)
+    guided_time = time.perf_counter() - start_time
 
     integrator_guided.save_hemi_q_values('learned_q_values.ply')    
     
-
     mse_no_guiding = calculate_mse(img_no_guiding, img_ref)
     mse_guided = calculate_mse(img_guided, img_ref)
     
+    print(f"\n--- Performance Summary ---")
+    print(f"Reference Time (256 spp): {ref_time:7.2f}s")
+    print(f"No Guiding Time ({spp_test} spp): {no_guiding_time:7.2f}s")
+    print(f"RL Training Time (5x4 spp):   {training_time:7.2f}s")
+    print(f"RL Guided Render Time ({spp_test} spp): {guided_time:7.2f}s")
+    print(f"Overhead Ratio (Guided/None): {guided_time / no_guiding_time:7.2f}x")
+
+    print(f"\n--- Quality Summary ---")
     print(f"MSE No Guiding: {mse_no_guiding:.6f}")
     print(f"MSE Guided RL:  {mse_guided:.6f}")
     
@@ -98,10 +114,8 @@ def test_learning_improvement(scene):
     mi.util.convert_to_bitmap(img_no_guiding).write('test_no_guiding.png')
     mi.util.convert_to_bitmap(img_guided).write('test_guided.png')
 
-    # for validation save the 3d scene into a ply file
     
-
-    # According to user, this might fail currently
+    
     assert mse_guided < mse_no_guiding
 
 if __name__ == "__main__":
