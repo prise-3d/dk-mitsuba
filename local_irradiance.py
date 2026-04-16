@@ -7,7 +7,7 @@ class SurfaceIrradianceVolume:
     A class that maintains a volume of irradiance estimates at sampled surface points in the scene,
     discretized into directional bins, and provides methods for sampling directions based on learned Q-values.
     """
-    def __init__(self, scene, positions, normals, resolution_u=8, resolution_v=8, grid_res=16):
+    def __init__(self, scene, positions, normals, resolution_u=8, resolution_v=8, grid_res=32):
         """
         Initializes the SurfaceIrradianceVolume with the given scene, sampled positions, normals, and discretization parameters.
         Input: - scene: The Mitsuba scene object.
@@ -28,7 +28,7 @@ class SurfaceIrradianceVolume:
         self._build_grid()
 
     @classmethod
-    def from_scene(cls, scene, n_points, resolution_u=8, resolution_v=8, grid_res=16):
+    def from_scene(cls, scene, n_points, resolution_u=8, resolution_v=8, grid_res=32):
         """
         Distributes a specified number of probes across the surfaces of the scene (excluding emitters) 
         and constructs a SurfaceIrradianceVolume for RL-guided sampling.
@@ -62,30 +62,14 @@ class SurfaceIrradianceVolume:
 
     def nearest_point(self, p, n):        
         """
-        Finds the nearest surface point index for a given 3D position p and normal n.
-        Restricts the search to points with a normal in the same direction (dot product > 0).
+        Finds the nearest surface point index using a spatial grid. O(1) complexity.
         """
         p_rel = (p - self.grid_min) / self.grid_size
         ix = dr.clip(mi.UInt32(p_rel.x * self.grid_res), 0, self.grid_res - 1)
         iy = dr.clip(mi.UInt32(p_rel.y * self.grid_res), 0, self.grid_res - 1)
         iz = dr.clip(mi.UInt32(p_rel.z * self.grid_res), 0, self.grid_res - 1)
         idx = ix + iy * self.grid_res + iz * (self.grid_res**2)
-        grid_idx = dr.gather(mi.UInt32, self.grid_data, idx)
-
-        # Verify alignment. If misaligned, we fallback to a search over all points.
-        is_aligned = dr.dot(n, dr.gather(mi.Vector3f, self.normals, grid_idx)) > 0
-
-        # Fallback: find the nearest point among those with positive normal alignment.
-        min_dist2, fallback_idx = dr.full(mi.Float, 1e30, dr.width(p)), dr.zeros(mi.UInt32, dr.width(p))
-        for i in range(self.n_points):
-            n_i = dr.gather(mi.Vector3f, self.normals, i)
-            p_i = dr.gather(mi.Point3f, self.positions, i)
-            valid = dr.dot(n, n_i) > 0
-            dist2 = dr.select(valid, dr.squared_norm(p - p_i), 1e31)
-            closer = dist2 < min_dist2
-            min_dist2, fallback_idx = dr.select(closer, dist2, min_dist2), dr.select(closer, mi.UInt32(i), fallback_idx)
-
-        return dr.select(is_aligned, grid_idx, fallback_idx)
+        return dr.gather(mi.UInt32, self.grid_data, idx)
 
     def update(self, spatial_indices, directions, rewards, active):
         """
@@ -303,7 +287,7 @@ class RLIntegrator(mi.SamplingIntegrator):
         super().__init__(props)
         self.n_probes, self.enable_guiding, self.update_q = props.get('n_probes', 1000), props.get('enable_guiding', True), props.get('update_q', True)
         self.resolution_u, self.resolution_v = props.get('resolution_u', 8), props.get('resolution_v', 8)
-        self.grid_res = props.get('grid_res', 16)
+        self.grid_res = props.get('grid_res', 32)
         self.volume = None
         self.next_event_estimation = True
 
@@ -341,11 +325,14 @@ class RLIntegrator(mi.SamplingIntegrator):
                     nee_contrib_val = dr.select(active_nee & ~occluded, emitter_weight * bsdf.eval(ctx, si, wo_nee, active_nee) * cos_nee, 0.0)
                     result += throughput * nee_contrib_val
 
+            # Optimisation : on cherche l'index de la sonde UNE SEULE FOIS par intersection
+            curr_idx = self.volume.nearest_point(si.p, si.n) if self.enable_guiding else dr.zeros(mi.UInt32, dr.width(active))
+
             # if enabled, update the Q-values based on the previous action 
             # and the observed radiance (Direct + NEE + Indirect)
             if self.update_q and self.enable_guiding and dr.any(has_prev):
                 active_up = has_prev & si.is_valid()
-                curr_idx, emitter = self.volume.nearest_point(si.p, si.n), si.emitter(scene, active_up)
+                emitter = si.emitter(scene, active_up)
                 L_dir = dr.select(emitter != None, emitter.eval(si, active_up), 0.0)
                 L_ind = dr.select(emitter == None, bsdf.eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx), 0.0)
                 # Le reward est la radiance sortante de si (émise + réfléchie)
@@ -358,8 +345,6 @@ class RLIntegrator(mi.SamplingIntegrator):
 
             # --- Guided Sampling with Robust MIS ---
             if self.enable_guiding:
-                curr_idx = self.volume.nearest_point(si.p, si.n)
-                
                 # Probabilité de guidage (alpha)
                 # On vérifie l'alignement des normales pour éviter le guidage "à travers" les murs
                 dot_n = dr.dot(si.n, dr.gather(mi.Vector3f, self.volume.normals, curr_idx))
