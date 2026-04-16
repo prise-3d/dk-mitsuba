@@ -334,7 +334,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                 active_nee = active & (mi.luminance(emitter_weight) > 0)
                 if dr.any(active_nee):
                     wo_nee = si.to_local(emitter_sample.d)
-                    # CRITIQUE : Le cosinus local est obligatoire ici
+                    # le cosinus local est obligatoire ici ?
                     cos_nee = dr.maximum(0.0, wo_nee.z)
                     shadow_ray = si.spawn_ray_to(emitter_sample.p)
                     occluded = scene.ray_test(shadow_ray, active_nee)

@@ -33,10 +33,10 @@ def test_learning_improvement(scene):
     Verifies if RL guiding reduces the error compared to classic Path Tracing.
     MSE(Guided, Ref) < MSE(NoGuiding, Ref)
     """
-    # 1. Récupérer la liste des formes de la scène
+    # Récupérer la liste des formes de la scène
     shapes = scene.shapes()
 
-    # 2. Boucler sur les formes et sauvegarder celles qui sont des maillages
+    # Boucler sur les formes et sauvegarder celles qui sont des maillages
     for i, shape in enumerate(shapes):
         # On vérifie si la shape a des données de maillage (vertices/faces)
         if isinstance(shape, mi.Mesh):
@@ -49,13 +49,13 @@ def test_learning_improvement(scene):
     print("\n=== Testing RL Guiding Improvement ===")
     spp_test = 64
     
-    # 1. Reference (Ground Truth) - Moderate SPP Path Tracing
+    # Reference (Ground Truth) - Moderate SPP Path Tracing
     print("\nRendering Reference (256 spp)...")
     ref_integrator = mi.load_dict({"type": "path"})    
 
     img_ref = mi.render(scene, integrator=ref_integrator, spp=256, seed=0)
     
-    # 2. No Guiding - budget spp_test
+    # No Guiding - budget spp_test
     print(f"Rendering No Guiding ({spp_test} spp)...")
     integrator_no_guiding = mi.load_dict({
         "type": "rl_integrator",
@@ -63,7 +63,7 @@ def test_learning_improvement(scene):
     })
     img_no_guiding = mi.render(scene, integrator=integrator_no_guiding, spp=spp_test, seed=1)
     
-    # 3. Guided RL - budget spp_test
+    # Guided RL - same spp_test budget, but with guiding enabled
     print(f"Training and Rendering Guided RL ({spp_test} spp)...")
     integrator_guided = mi.load_dict({
         "type": "rl_integrator",
@@ -71,7 +71,7 @@ def test_learning_improvement(scene):
         "update_q": True,
         "n_probes": 200,
         "resolution_u": 8,
-        "resolution_v": 8,
+        "resolution_v": 8
     })
     
     # Training passes (some passes to fill Q-values)
