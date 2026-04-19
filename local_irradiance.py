@@ -290,6 +290,22 @@ class RLIntegrator(mi.SamplingIntegrator):
         self.grid_res = props.get('grid_res', 32)
         self.volume = None
         self.next_event_estimation = False
+        self.total_rays_count = dr.zeros(mi.Float, 1)
+        self.zero_rays_count = dr.zeros(mi.Float, 1)
+
+    def render(self, scene, sensor=0, seed=0, spp=0, develop=True, evaluate=True):
+        # Reset counters for the current render call
+        dr.scatter(self.total_rays_count, 0.0, 0)
+        dr.scatter(self.zero_rays_count, 0.0, 0)
+        
+        result = super().render(scene, sensor, seed, spp, develop, evaluate)
+        
+        dr.eval(self.total_rays_count, self.zero_rays_count)
+        total = float(self.total_rays_count[0])
+        zero = float(self.zero_rays_count[0])
+        if total > 0:
+            print(f"  [RLIntegrator] Zero-contribution rays: {zero/total:.2%} ({int(zero)}/{int(total)})")
+        return result
 
     def sample(self, scene, sampler, ray, medium, active, update_q=True):
         """
@@ -373,6 +389,12 @@ class RLIntegrator(mi.SamplingIntegrator):
                 direction, throughput, has_prev = si.to_world(bs_s.wo), throughput * bs_w, dr.full(mi.Bool, False, dr.width(active))
 
             ray, active, depth = si.spawn_ray(direction), active & dr.any(throughput != 0.0), depth + 1
+        
+        # Proportion of zero contribution rays calculation
+        is_zero = mi.luminance(result) < 1e-7
+        dr.scatter_add(self.total_rays_count, 0, mi.Float(dr.width(result)))
+        dr.scatter_add(self.zero_rays_count, 0, dr.sum(dr.select(is_zero, 1.0, 0.0)))
+        
         return result, active, []
     
     def save_hemi_q_values(self, path):
