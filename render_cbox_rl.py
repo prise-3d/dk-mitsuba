@@ -1,6 +1,7 @@
 import mitsuba as mi
 import drjit as dr
 import os
+import time
 
 # Ensure the correct variant is set before importing the integrator
 mi.set_variant('llvm_ad_rgb')
@@ -74,13 +75,12 @@ class CornellBoxRenderer:
         
         return image
     
-    def mi_render(self, integrator = mi.load_dict({"type": "path"}),
-                  spp=1024, res=256, 
-                  output_filename='cbox_mi.png') :
+    def mi_render(self, spp=1024, res=256, output_filename='cbox_mi.png'):
         """
-        Renders the scene using Mitsuba's default Path Tracer.
+        Renders the scene using the RLIntegrator with guiding disabled.
+        This serves as a baseline Path Tracer (BSDF sampling only, no NEE).
         """
-        print(f"Starting render with Mitsuba's default Path Tracer ({spp} spp)...")
+        print(f"Starting render with baseline Path Tracer (no NEE) ({spp} spp)...")
 
         # Change resolution dynamically
         params = mi.traverse(self.scene)
@@ -114,14 +114,22 @@ if __name__ == "__main__":
     os.chdir(output_dir)
 
     print("--- Rendering with Guided RL (Updating Q) ---")
+    start = time.perf_counter()
     renderer.render(spp=spp, output_filename=f'render_result.{format}')
+    print(f"Total execution time: {time.perf_counter() - start:.2f}s")
     
     print("\n--- Rendering with Guided RL (No Update) ---")
+    start = time.perf_counter()
     renderer.render(spp=spp, update_q=False, output_filename=f'render_result_no_update.{format}')
+    print(f"Total execution time: {time.perf_counter() - start:.2f}s")
     
     print("\n--- Rendering with No Guiding ---")
+    start = time.perf_counter()
     renderer.render(spp=spp, guiding=False, output_filename=f'render_result_no_guiding.{format}')
+    print(f"Total execution time: {time.perf_counter() - start:.2f}s")
 
     print("\n--- Render with Mitsuba's default Path Tracer ---")
+    start = time.perf_counter()
     renderer.mi_render(spp=spp, output_filename=f'render_result_mi.{format}')
+    print(f"Total execution time: {time.perf_counter() - start:.2f}s")
     

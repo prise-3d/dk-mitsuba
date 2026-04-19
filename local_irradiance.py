@@ -289,7 +289,7 @@ class RLIntegrator(mi.SamplingIntegrator):
         self.resolution_u, self.resolution_v = props.get('resolution_u', 8), props.get('resolution_v', 8)
         self.grid_res = props.get('grid_res', 32)
         self.volume = None
-        self.next_event_estimation = True
+        self.next_event_estimation = False
 
     def sample(self, scene, sampler, ray, medium, active, update_q=True):
         """
