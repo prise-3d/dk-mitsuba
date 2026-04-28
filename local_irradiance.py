@@ -240,33 +240,66 @@ class SurfaceIrradianceVolume:
             f.write("end_header\n")
 
             # Write vertices for each bin direction, colored by the Q-values
+            # Represent every vertex needed later
+            total      = n_points * n_bins * 4
+            lane       = dr.arange(mi.UInt32, total)
+            probe_idx  = lane // (n_bins * 4)
+            bin_idx    = (lane // 4) % n_bins
+            corner_idx = lane % 4
 
-            for i in range(n_points):
-                p = dr.gather(mi.Point3f, self.positions, i)
-                n = dr.gather(mi.Vector3f, self.normals, i)
-                q_list = self.get_q_data(i)
-                frame = mi.Frame3f(n)
-                for j in range(n_bins):
-                    q = q_list[j]
-                    r, g, b = q.x[0], q.y[0], q.z[0]
-                    u_idx, v_idx = j % res_u, j // res_u
-                    for du, dv in [(0, 0), (1, 0), (1, 1), (0, 1)]:
-                        phi = (u_idx + du) * (2 * dr.pi / res_u)
-                        cos_theta = dr.clip((v_idx + dv) / res_v, 0.0, 1.0)
-                        sin_theta = dr.safe_sqrt(1.0 - cos_theta * cos_theta)
-                        local_dir = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
-                        v_pos = p + frame.to_world(local_dir) * radius
-                        f.write(f"{v_pos.x[0]} {v_pos.y[0]} {v_pos.z[0]} {r} {g} {b}\n")
+            # compute corner offsets w/ DrJit
+            du = dr.select((corner_idx == 1) | (corner_idx == 2), 1, 0)                                                                                                            
+            dv = dr.select(corner_idx >= 2, 1, 0)
 
-            # Write faces for the quads                        
+            # build the local direction in w/ DrJit
+            u_idx     = bin_idx %  res_u                                                                                                                                               
+            v_idx     = bin_idx // res_u                                                                                                                                               
+            phi       = mi.Float(u_idx + du) * (2 * dr.pi / res_u)
+            cos_theta = dr.clip(mi.Float(v_idx + dv) / res_v, 0.0, 1.0)                                                                                                            
+            sin_theta = dr.safe_sqrt(1.0 - cos_theta * cos_theta)                                                                                                                  
+            local_dir = mi.Vector3f(sin_theta * dr.cos(phi),                                                                                                                       
+                                    sin_theta * dr.sin(phi),                                                                                                                       
+                                    cos_theta)
+            
+            # gather positions, normals and colors per lane
+            p  = dr.gather(mi.Point3f,  self.positions, probe_idx)                                                                                                                 
+            n  = dr.gather(mi.Vector3f, self.normals,   probe_idx)
+                                                                                                                                                                                    
+            flat_pb = probe_idx * n_bins + bin_idx        # bin slot in the SoA Q arrays                                                                                           
+            counts  = dr.maximum(dr.gather(mi.Float, self.visit_counts, flat_pb), 1.0)                                                                                             
+            r       = dr.gather(mi.Float, self.sum_r, flat_pb) / counts                                                                                                                  
+            g       = dr.gather(mi.Float, self.sum_g, flat_pb) / counts                                                                                                                  
+            b       = dr.gather(mi.Float, self.sum_b, flat_pb) / counts
 
-            for i in range(n_points):
-                q_list = self.get_q_data(i)
-                for j in range(n_bins):
-                    q = q_list[j]
-                    r, g, b = dr.clip(q.x[0], 0, 1), dr.clip(q.y[0], 0, 1), dr.clip(q.z[0], 0, 1)
-                    idx = i * n_bins + j
-                    f.write(f"4 {idx*4} {idx*4+1} {idx*4+2} {idx*4+3} {int(r*255)} {int(g*255)} {int(b*255)}\n")
+            # compute the frame
+            v_pos = p + mi.Frame3f(n).to_world(local_dir) * radius
+
+            # sync to numpy
+            xyz   = np.asarray(v_pos).T          # shape (total, 3)                                                                                                                  
+            rs    = np.asarray(r)                # shape (total,)
+            gs    = np.asarray(g)                                                                                                                                                    
+            bs    = np.asarray(b)
+            verts = np.column_stack([xyz, rs, gs, bs])   # shape (total, 6)
+
+            # stream vertices
+            np.savetxt(f, verts, fmt="%g %g %g %g %g %g")
+
+            # ~ Same thing, for the faces
+            n_faces     = n_points * n_bins # 1 row per (probe, bin)
+            face_lane   = dr.arange(mi.UInt32, n_faces)
+            flat_pb_f   = face_lane                                                                            
+            counts_f    = dr.maximum(dr.gather(mi.Float, self.visit_counts, flat_pb_f), 1.0)                                                                                       
+            rf = dr.clip(dr.gather(mi.Float, self.sum_r, flat_pb_f) / counts_f, 0.0, 1.0)                                                                                          
+            gf = dr.clip(dr.gather(mi.Float, self.sum_g, flat_pb_f) / counts_f, 0.0, 1.0)                                                                                          
+            bf = dr.clip(dr.gather(mi.Float, self.sum_b, flat_pb_f) / counts_f, 0.0, 1.0)
+            
+            R     = (np.asarray(rf) * 255).astype(np.int32)                                                                                                                            
+            G     = (np.asarray(gf) * 255).astype(np.int32)                                                                                                                            
+            B     = (np.asarray(bf) * 255).astype(np.int32)
+            v0    = np.arange(n_faces, dtype=np.int32) * 4                                                                                                                         
+            fours = np.full(n_faces, 4, dtype=np.int32)
+            faces = np.column_stack([fours, v0, v0 + 1, v0 + 2, v0 + 3, R, G, B])                                                                                                        
+            np.savetxt(f, faces, fmt="%d")
 
 class RLIntegrator(mi.SamplingIntegrator):
     """
