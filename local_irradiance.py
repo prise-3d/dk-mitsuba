@@ -336,8 +336,9 @@ class RLIntegrator(mi.SamplingIntegrator):
             )
             
         throughput, result = mi.Spectrum(1.0), mi.Spectrum(0.0)
-        prev_idx, prev_dir, has_prev, depth = dr.zeros(mi.UInt32, dr.width(active)), mi.Vector3f(0.0), dr.full(mi.Bool, False, dr.width(active)), 0
-        while dr.any(active) and depth < 8:
+
+        prev_idx, prev_dir, has_prev = dr.zeros(mi.UInt32, dr.width(active)),mi.Vector3f(0.0), dr.full(mi.Bool, False, dr.width(active))
+        for _ in range(8):
             si = scene.ray_intersect(ray, active)
             active &= si.is_valid()
             
@@ -346,24 +347,26 @@ class RLIntegrator(mi.SamplingIntegrator):
             ctx = mi.BSDFContext()
 
             # Next Event Estimation (NEE)
-            if dr.any(active) and self.next_event_estimation:
-                emitter_sample, emitter_weight = scene.sample_emitter_direction(si, sampler.next_2d(active), True, active)
+            if self.next_event_estimation:
+                # sampler_emitter_direction already mask inactive lanes, so it is ok -- and much faster -- to not check agains dr.any(active)
+                emitter_sample, emitter_weight = scene.sample_emitter_direction(si, sampler.next_2d(active), True, active=active)
                 active_nee = active & (mi.luminance(emitter_weight) > 0)
-                if dr.any(active_nee):
-                    wo_nee = si.to_local(emitter_sample.d)
-                    # le cosinus local est obligatoire ici ?
-                    cos_nee = dr.maximum(0.0, wo_nee.z)
-                    shadow_ray = si.spawn_ray_to(emitter_sample.p)
-                    occluded = scene.ray_test(shadow_ray, active_nee)
-                    nee_contrib_val = dr.select(active_nee & ~occluded, emitter_weight * bsdf.eval(ctx, si, wo_nee, active_nee) * cos_nee, 0.0)
-                    result += throughput * nee_contrib_val
+                wo_nee = si.to_local(emitter_sample.d)
+                cos_nee = dr.maximum(0.0, wo_nee.z)
+                shadow_ray = si.spawn_ray_to(emitter_sample.p)
+                # same here: active_nee already masks
+                occluded = scene.ray_test(shadow_ray, active_nee)
+                nee_contrib_val = dr.select(active_nee & ~occluded,
+                                            emitter_weight * bsdf.eval(ctx, si, wo_nee, active_nee) * cos_nee,
+                                            0.0)
+                result += throughput * nee_contrib_val
 
             # Optimisation : on cherche l'index de la sonde UNE SEULE FOIS par intersection
             curr_idx = self.volume.nearest_point(si.p, si.n) if self.enable_guiding else dr.zeros(mi.UInt32, dr.width(active))
 
-            # if enabled, update the Q-values based on the previous action 
-            # and the observed radiance (Direct + NEE + Indirect)
-            if self.update_q and self.enable_guiding and dr.any(has_prev):
+            # update the Q-values based on the previous action 
+            if self.update_q and self.enable_guiding:
+                # on the first bounce, has_prev is all False, propagated to volume.update through active_up
                 active_up = has_prev & si.is_valid()
                 emitter = si.emitter(scene, active_up)
                 L_dir = dr.select(emitter != None, emitter.eval(si, active_up), 0.0)
@@ -372,9 +375,14 @@ class RLIntegrator(mi.SamplingIntegrator):
                 self.volume.update(prev_idx, prev_dir, L_dir + nee_contrib_val + L_ind, active_up)
 
             emitter_hit = si.emitter(scene, active)
-            if dr.any(active & (emitter_hit != None)): result += throughput * emitter_hit.eval(si, active)
-        
-            if not dr.any(active): break
+            # if dr.any(active & (emitter_hit != None)): result += throughput * emitter_hit.eval(si, active)
+            result += dr.select(active & (emitter_hit != None),
+                                throughput * emitter_hit.eval(si, active),
+                                mi.Spectrum(0.0)
+                                )
+            
+            # useless costly overhead
+            # if not dr.any(active): break
 
             # --- Guided Sampling with Robust MIS ---
             if self.enable_guiding:
@@ -405,7 +413,8 @@ class RLIntegrator(mi.SamplingIntegrator):
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
                 direction, throughput, has_prev = si.to_world(bs_s.wo), throughput * bs_w, dr.full(mi.Bool, False, dr.width(active))
 
-            ray, active, depth = si.spawn_ray(direction), active & dr.any(throughput != 0.0), depth + 1
+            ray = si.spawn_ray(direction)
+            active = active & (mi.luminance(throughput) > 0.0)
         return result, active, []
     
     def save_hemi_q_values(self, path):
