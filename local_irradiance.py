@@ -352,12 +352,12 @@ class RLIntegrator(mi.SamplingIntegrator):
                 emitter_sample, emitter_weight = scene.sample_emitter_direction(si, sampler.next_2d(active), True, active=active)
                 active_nee = active & (mi.luminance(emitter_weight) > 0)
                 wo_nee = si.to_local(emitter_sample.d)
-                cos_nee = dr.maximum(0.0, wo_nee.z)
                 shadow_ray = si.spawn_ray_to(emitter_sample.p)
                 # same here: active_nee already masks
                 occluded = scene.ray_test(shadow_ray, active_nee)
+                # bsdf.eval already includes the cosine term
                 nee_contrib_val = dr.select(active_nee & ~occluded,
-                                            emitter_weight * bsdf.eval(ctx, si, wo_nee, active_nee) * cos_nee,
+                                            emitter_weight * bsdf.eval(ctx, si, wo_nee, active_nee),
                                             0.0)
                 result += throughput * nee_contrib_val
 
@@ -404,8 +404,8 @@ class RLIntegrator(mi.SamplingIntegrator):
                 pdf_rl = self.volume.pdf_direction(curr_idx, direction)
                 pdf_mix = alpha * pdf_rl + (1.0 - alpha) * pdf_bsdf
                 
-                # Mise à jour du throughput (f * cos / pdf_mix)
-                weight = dr.select(pdf_mix > 1e-7, (bsdf.eval(ctx, si, wo_local, active) * dr.maximum(0.0, wo_local.z)) / pdf_mix, 0.0)
+                # throughput update (f * cos / pdf_mix) -- cosine term already included
+                weight = dr.select(pdf_mix > 1e-7, bsdf.eval(ctx, si, wo_local, active) / pdf_mix, 0.0)
                 throughput *= dr.select(alpha > 0, weight, bs_w)
                 
                 prev_idx, prev_dir, has_prev = curr_idx, direction, active & (dr.any(throughput > 0.0))
