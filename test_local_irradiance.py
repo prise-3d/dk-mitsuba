@@ -148,7 +148,7 @@ def test_save_function():
     vol = SurfaceIrradianceVolume.from_scene(scene, 100)
     
     # Sauvegarder dans un fichier temporaire
-    output_path = 'test_surface_points.ply'
+    output_path = 'ply/test_surface_points.ply'
     vol.save(output_path)
     
 
@@ -156,7 +156,7 @@ def test_save_function():
     with open(output_path, 'r') as f:
         assert f.readline().strip() == "ply"
 
-    output_path_hemisphere = 'hemisphere_points.ply'
+    output_path_hemisphere = 'ply/hemisphere_points.ply'
     vol.save_hemi(output_path_hemisphere)
         
 
