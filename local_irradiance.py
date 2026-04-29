@@ -116,7 +116,7 @@ class SurfaceIrradianceVolume:
         for i, q in enumerate(all_q): res += q * self.bin_cosines[i]
         return mi.luminance(res)
 
-    def _compute_weights(self, spatial_indices, threshold=1e-3):
+    def _compute_weights(self, spatial_indices, threshold=0.05):
         """
         Computes the probability weights for each bin proportional to Q*f_s*cos
         with a positive threshold clamp on Q for ergodicity.
