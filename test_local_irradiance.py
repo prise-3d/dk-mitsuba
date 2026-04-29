@@ -47,13 +47,13 @@ def test_update_and_query_averaging():
     active = mi.Bool([True])
     
     # first update
-    vol.update(idx, direction, mi.Color3f(10.0), active)
+    vol.update(idx, mi.Vector3f(0, 0, 1), direction, mi.Color3f(10.0), active)
     q_data = vol.get_q_data(idx)
     # For normal direction (0,0,1) and 2x2 resolution, flat_idx calculation results in bin 2
     assert dr.allclose(q_data[2], 10.0)
-    
+
     # second update (same bin)
-    vol.update(idx, direction, mi.Color3f(20.0), active)
+    vol.update(idx, mi.Vector3f(0, 0, 1), direction, mi.Color3f(20.0), active)
     q_data = vol.get_q_data(idx)
     assert dr.allclose(q_data[2], 15.0) # (10 + 20) / 2
 
@@ -69,7 +69,7 @@ def test_directional_bins():
     dir_side = mi.Vector3f([1, 0, 0])
     active = mi.Bool([True])
     
-    vol.update(idx, dir_up, mi.Color3f(100.0), active)
+    vol.update(idx, mi.Vector3f(0, 0, 1), dir_up, mi.Color3f(100.0), active)
     
     q_data = vol.get_q_data(idx)
     # 4x4 bins: dir_up (0,0,1) maps to bin 12, dir_side (1,0,0) maps to bin 0

@@ -74,16 +74,16 @@ class SurfaceIrradianceVolume:
         idx = ix + iy * self.grid_res + iz * (self.grid_res**2)
         return dr.gather(mi.UInt32, self.grid_data, idx)
 
-    def update(self, spatial_indices, directions, rewards, active):
+    def update(self, spatial_indices, frame_n, directions, rewards, active):
         """
         Updates the Q-values for the given spatial indices, directions, and rewards based on the observed samples.
         Input: - spatial_indices: The indices of the surface points corresponding to the samples.
                - directions: The world-space direction vectors of the samples.
                - rewards: The observed rewards (radiance) for the samples, as a Color3f.
                - active: A boolean mask indicating which samples are active and should be updated.
-        """   
-        n = dr.gather(mi.Vector3f, self.normals, spatial_indices)
-        w_l = mi.Frame3f(n).to_local(directions)
+        """
+        w_l = mi.Frame3f(frame_n).to_local(directions)
+        active = active & (w_l.z > 0)
         phi = dr.atan2(w_l.y, w_l.x)
         u_idx = dr.minimum(mi.UInt32((phi / (2*dr.pi) + dr.select(phi < 0, 1.0, 0.0)) * self.res_u), self.res_u - 1)
         v_idx = dr.minimum(mi.UInt32(dr.clip(w_l.z, 0.0, 1.0) * self.res_v), self.res_v - 1)
@@ -153,7 +153,7 @@ class SurfaceIrradianceVolume:
         
         return bin_idx, u_local
 
-    def _map_to_world_direction(self, spatial_indices, bin_idx, u_l, sample_y):
+    def _map_to_world_direction(self, spatial_indices, frame_n, bin_idx, u_l, sample_y):
         """
         Maps the selected bin and continuous samples to a world-space direction vector.
         Reference: Dahm & Keller (2017), Section 3.1 - Spatial and Directional Discretization.
@@ -161,11 +161,11 @@ class SurfaceIrradianceVolume:
         phi = (mi.Float(bin_idx % self.res_u) + u_l) * (2 * dr.pi / self.res_u)
         cos_theta = dr.clip((mi.Float(bin_idx // self.res_u) + sample_y) / self.res_v, 0.0, 1.0)
         sin_theta = dr.safe_sqrt(1.0 - cos_theta * cos_theta)
-        
-        local_dir = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
-        return mi.Frame3f(dr.gather(mi.Vector3f, self.normals, spatial_indices)).to_world(local_dir)
 
-    def sample_direction(self, spatial_indices, sample):
+        local_dir = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
+        return mi.Frame3f(frame_n).to_world(local_dir)
+
+    def sample_direction(self, spatial_indices, frame_n, sample):
         """Samples a direction based on the learned Q-values and returns the corresponding PDF.
         Input: - spatial_indices: The indices of the surface points for which to sample directions.
                - sample: A 2D sample (sample.x, sample.y) in the range [0, 1] used for sampling the bin and the local offset.
@@ -174,13 +174,13 @@ class SurfaceIrradianceVolume:
         """
         weights = self._compute_weights(spatial_indices)
         bin_idx, u_l = self._sample_bin_discrete(weights, sample.x)
-        direction = self._map_to_world_direction(spatial_indices, bin_idx, u_l, sample.y)
+        direction = self._map_to_world_direction(spatial_indices, frame_n, bin_idx, u_l, sample.y)
 
         pdf = dr.zeros(mi.Float, dr.width(spatial_indices))
         for i in range(self.n_bins_per_point): pdf = dr.select(bin_idx == i, weights[i], pdf)
         return direction, pdf * (self.n_bins_per_point / (2 * dr.pi))
 
-    def pdf_direction(self, spatial_indices, directions):
+    def pdf_direction(self, spatial_indices, frame_n, directions):
         """Computes the PDF for given directions based on the learned Q-values.
         Input: - spatial_indices: The indices of the surface points for which to compute the PDF.
                - directions: The world-space direction vectors for which to compute the PDF.
@@ -188,8 +188,7 @@ class SurfaceIrradianceVolume:
         weights = self._compute_weights(spatial_indices)
 
         # Determine which bin the given directions fall into
-        n = dr.gather(mi.Vector3f, self.normals, spatial_indices)
-        w_l = mi.Frame3f(n).to_local(directions)
+        w_l = mi.Frame3f(frame_n).to_local(directions)
         phi = dr.atan2(w_l.y, w_l.x)
         u_idx = dr.minimum(mi.UInt32((phi / (2*dr.pi) + dr.select(phi < 0, 1.0, 0.0)) * self.res_u), self.res_u - 1)
         v_idx = dr.minimum(mi.UInt32(dr.clip(w_l.z, 0.0, 1.0) * self.res_v), self.res_v - 1)
@@ -349,6 +348,7 @@ class RLIntegrator(mi.SamplingIntegrator):
         prev_delta = mi.Bool(True)
         
         prev_si = dr.zeros(mi.SurfaceInteraction3f)
+        prev_frame_n = mi.Vector3f(0, 0, 1)
 
         for _ in range(8):
             si = scene.ray_intersect(ray, active)
@@ -387,7 +387,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                 L_dir = dr.select(emitter != None, emitter.eval(si, active_up), 0.0)
                 L_ind = dr.select(emitter == None, bsdf.eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx), 0.0)
                 # Le reward est la radiance sortante de si (émise + réfléchie)
-                self.volume.update(prev_idx, prev_dir, L_dir + nee_contrib_val + L_ind, active_up)
+                self.volume.update(prev_idx, prev_frame_n, prev_dir, L_dir + nee_contrib_val + L_ind, active_up)
 
             emitter_hit = si.emitter(scene, active)
             active_em_hit = active & (emitter_hit != None)
@@ -408,7 +408,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                 alpha = dr.select((dot_n > 0.5) & (self.volume.get_total_visits(curr_idx) > 50), 0.4, 0.0)
                 
                 # Tirage de la direction (RL ou BSDF)
-                wo_rl, _ = self.volume.sample_direction(curr_idx, sampler.next_2d(active))
+                wo_rl, _ = self.volume.sample_direction(curr_idx, si.sh_frame.n, sampler.next_2d(active))
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
                 
                 direction = dr.select(sampler.next_1d(active) < alpha, wo_rl, si.to_world(bs_s.wo))
@@ -417,7 +417,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                 # Calcul du PDF combiné (MIS)
                 # Important : le PDF de la BSDF doit être évalué sur la direction finale
                 pdf_bsdf = bsdf.pdf(ctx, si, wo_local, active)
-                pdf_rl = self.volume.pdf_direction(curr_idx, direction)
+                pdf_rl = self.volume.pdf_direction(curr_idx, si.sh_frame.n, direction)
                 pdf_mix = alpha * pdf_rl + (1.0 - alpha) * pdf_bsdf
                 
                 # throughput update (f * cos / pdf_mix) -- cosine term already included
@@ -429,11 +429,13 @@ class RLIntegrator(mi.SamplingIntegrator):
                 prev_pdf = dr.select(alpha > 0, pdf_mix, bs_s.pdf)
                 prev_delta = dr.select(alpha > 0, mi.Bool(False), bsdf_delta)
                 prev_si = si
+                prev_frame_n = si.sh_frame.n
             else:
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
                 direction, throughput, has_prev = si.to_world(bs_s.wo), throughput * bs_w, dr.full(mi.Bool, False, dr.width(active))
                 prev_pdf = bs_s.pdf
                 prev_delta = mi.has_flag(bs_s.sampled_type, mi.BSDFFlags.Delta)
+                prev_frame_n = si.sh_frame.n
                 prev_si = si
 
             ray = si.spawn_ray(direction)
