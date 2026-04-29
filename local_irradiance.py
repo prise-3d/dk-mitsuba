@@ -394,14 +394,11 @@ class RLIntegrator(mi.SamplingIntegrator):
             ds = mi.DirectionSample3f(scene, si=si, ref=prev_si)
             em_pdf = scene.pdf_emitter_direction(prev_si, ds, active_em_hit & ~prev_delta)
             w_bsdf = mis_weight(prev_pdf, em_pdf)
-            # if dr.any(active & (emitter_hit != None)): result += throughput * emitter_hit.eval(si, active)
+
             result += dr.select(active_em_hit,
                                 throughput * w_bsdf * emitter_hit.eval(si, active),
                                 mi.Spectrum(0.0)
                                 )
-            
-            # useless costly overhead
-            # if not dr.any(active): break
 
             # --- Guided Sampling with Robust MIS ---
             if self.enable_guiding:
