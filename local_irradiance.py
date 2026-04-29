@@ -146,9 +146,12 @@ class SurfaceIrradianceVolume:
 
         prev_c = dr.zeros(mi.Float, dr.width(sample_x))
         for i in range(self.n_bins_per_point): prev_c = dr.select(bin_idx == i, (cum_w[i-1] if i > 0 else 0.0), prev_c)
-        
+
+        cur_c = dr.zeros(mi.Float, dr.width(sample_x))
+        for i in range(self.n_bins_per_point): cur_c = dr.select(bin_idx == i, cum_w[i], cur_c)
+
         # Calculate relative position within the bin for continuous sampling
-        bin_width = dr.maximum(dr.gather(mi.Float, dr.concat(cum_w), bin_idx) - prev_c, 1e-7)
+        bin_width = dr.maximum(cur_c - prev_c, 1e-7)
         u_local = dr.clip((sample_x - prev_c) / bin_width, 0.0, 1.0)
         
         return bin_idx, u_local
