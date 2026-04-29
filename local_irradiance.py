@@ -116,24 +116,20 @@ class SurfaceIrradianceVolume:
         for i, q in enumerate(all_q): res += q * self.bin_cosines[i]
         return mi.luminance(res)
 
-    def _compute_weights(self, spatial_indices, epsilon=0.1):
+    def _compute_weights(self, spatial_indices, threshold=1e-3):
         """
-        Computes the probability weights for each bin using an epsilon-greedy strategy.
-        Reference: Dahm & Keller (2017), Eq. (5) - Probability distribution P_i
+        Computes the probability weights for each bin proportional to Q*f_s*cos
+        with a positive threshold clamp on Q for ergodicity.
+        Reference: Dahm & Keller (2017), Section 3.1.
         """
         all_q = self.get_q_data(spatial_indices)
-        q_cos = [mi.luminance(q) * self.bin_cosines[i] for i, q in enumerate(all_q)]
-        
+        q_lum = [dr.maximum(mi.luminance(q), threshold) for q in all_q]
+        q_cos = [q_lum[i] * self.bin_cosines[i] for i in range(self.n_bins_per_point)]
+
         q_sum = dr.zeros(mi.Float, dr.width(spatial_indices))
         for val in q_cos: q_sum += val
 
-        # Mix learned distribution with uniform distribution for exploration
-        weights = [
-            dr.select(q_sum > 1e-6, 
-                      (1.0 - epsilon) * q_c / q_sum + epsilon / self.n_bins_per_point, 
-                      1.0 / self.n_bins_per_point) 
-            for q_c in q_cos
-        ]
+        weights = [q_c / q_sum for q_c in q_cos]
         return weights
 
     def _sample_bin_discrete(self, weights, sample_x):
@@ -142,7 +138,9 @@ class SurfaceIrradianceVolume:
         Reference: Dahm & Keller (2017), Section 3.1 - Sampling the piece-wise constant PDF.
         """
         cum_w, curr = [], dr.zeros(mi.Float, dr.width(sample_x))
-        for w in weights: curr += w; cum_w.append(curr)
+        for w in weights:
+            curr = curr + w
+            cum_w.append(curr)
 
         bin_idx = dr.zeros(mi.UInt32, dr.width(sample_x))
         for i in range(self.n_bins_per_point - 1):
