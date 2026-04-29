@@ -369,6 +369,15 @@ class RLIntegrator(mi.SamplingIntegrator):
             bsdf = si.bsdf(ray)
             ctx = mi.BSDFContext()
 
+            # Optimisation : on cherche l'index de la sonde UNE SEULE FOIS par intersection
+            if self.enable_guiding:
+                curr_idx, curr_valid = self.volume.nearest_point(si.p, si.sh_frame.n)
+                alpha = dr.select(curr_valid & (self.volume.get_total_visits(curr_idx) > 50), 1.0, 0.0)
+            else:
+                curr_idx = dr.zeros(mi.UInt32, dr.width(active))
+                curr_valid = mi.Bool(False)
+                alpha = mi.Float(0.0)
+
             # Next Event Estimation (NEE)
             if self.next_event_estimation:
                 # sampler_emitter_direction already mask inactive lanes, so it is ok -- and much faster -- to not check agains dr.any(active)
@@ -379,20 +388,18 @@ class RLIntegrator(mi.SamplingIntegrator):
                 # same here: active_nee already masks
                 occluded = scene.ray_test(shadow_ray, active_nee)
                 bsdf_pdf_at_em = bsdf.pdf(ctx, si, wo_nee, active_nee)
-                bsdf_pdf_at_em = dr.select(emitter_sample.delta, 0.0, bsdf_pdf_at_em)
-                w_nee = mis_weight(emitter_sample.pdf, bsdf_pdf_at_em)
+                if self.enable_guiding:
+                    pdf_rl_at_em = self.volume.pdf_direction(curr_idx, si.sh_frame.n, emitter_sample.d)
+                    pt_pdf_at_em = alpha * pdf_rl_at_em + (1.0 - alpha) * bsdf_pdf_at_em
+                else:
+                    pt_pdf_at_em = bsdf_pdf_at_em
+                pt_pdf_at_em = dr.select(emitter_sample.delta, 0.0, pt_pdf_at_em)
+                w_nee = mis_weight(emitter_sample.pdf, pt_pdf_at_em)
                 # bsdf.eval already includes the cosine term
                 nee_contrib_val = dr.select(active_nee & ~occluded,
                                             emitter_weight * bsdf.eval(ctx, si, wo_nee, active_nee),
                                             0.0)
                 result += throughput * w_nee * nee_contrib_val
-
-            # Optimisation : on cherche l'index de la sonde UNE SEULE FOIS par intersection
-            if self.enable_guiding:
-                curr_idx, curr_valid = self.volume.nearest_point(si.p, si.sh_frame.n)
-            else:
-                curr_idx = dr.zeros(mi.UInt32, dr.width(active))
-                curr_valid = mi.Bool(False)
 
             # update the Q-values based on the previous action 
             if self.update_q and self.enable_guiding:
@@ -417,10 +424,6 @@ class RLIntegrator(mi.SamplingIntegrator):
 
             # --- Guided Sampling with Robust MIS ---
             if self.enable_guiding:
-                # Probabilité de guidage (alpha)
-                # On vérifie l'alignement des normales pour éviter le guidage "à travers" les murs
-                alpha = dr.select(curr_valid & (self.volume.get_total_visits(curr_idx) > 50), 0.4, 0.0)
-                
                 # Tirage de la direction (RL ou BSDF)
                 wo_rl, _ = self.volume.sample_direction(curr_idx, si.sh_frame.n, sampler.next_2d(active))
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
