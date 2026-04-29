@@ -2,6 +2,9 @@ import drjit as dr
 import mitsuba as mi
 import numpy as np
 
+def mis_weight(pdf_a, pdf_b):
+    return dr.select(pdf_a > 0, pdf_a / (pdf_a + pdf_b), 0)
+
 class SurfaceIrradianceVolume:
     """
     A class that maintains a volume of irradiance estimates at sampled surface points in the scene,
@@ -338,6 +341,15 @@ class RLIntegrator(mi.SamplingIntegrator):
         throughput, result = mi.Spectrum(1.0), mi.Spectrum(0.0)
 
         prev_idx, prev_dir, has_prev = dr.zeros(mi.UInt32, dr.width(active)),mi.Vector3f(0.0), dr.full(mi.Bool, False, dr.width(active))
+
+        # solid angle pdf used to generate a ray
+        prev_pdf = mi.Float(1.0)
+
+        # was the previous sample a specular reflection?
+        prev_delta = mi.Bool(True)
+        
+        prev_si = dr.zeros(mi.SurfaceInteraction3f)
+
         for _ in range(8):
             si = scene.ray_intersect(ray, active)
             active &= si.is_valid()
@@ -355,11 +367,14 @@ class RLIntegrator(mi.SamplingIntegrator):
                 shadow_ray = si.spawn_ray_to(emitter_sample.p)
                 # same here: active_nee already masks
                 occluded = scene.ray_test(shadow_ray, active_nee)
+                bsdf_pdf_at_em = bsdf.pdf(ctx, si, wo_nee, active_nee)
+                bsdf_pdf_at_em = dr.select(emitter_sample.delta, 0.0, bsdf_pdf_at_em)
+                w_nee = mis_weight(emitter_sample.pdf, bsdf_pdf_at_em)
                 # bsdf.eval already includes the cosine term
                 nee_contrib_val = dr.select(active_nee & ~occluded,
                                             emitter_weight * bsdf.eval(ctx, si, wo_nee, active_nee),
                                             0.0)
-                result += throughput * nee_contrib_val
+                result += throughput * w_nee * nee_contrib_val
 
             # Optimisation : on cherche l'index de la sonde UNE SEULE FOIS par intersection
             curr_idx = self.volume.nearest_point(si.p, si.n) if self.enable_guiding else dr.zeros(mi.UInt32, dr.width(active))
@@ -375,9 +390,13 @@ class RLIntegrator(mi.SamplingIntegrator):
                 self.volume.update(prev_idx, prev_dir, L_dir + nee_contrib_val + L_ind, active_up)
 
             emitter_hit = si.emitter(scene, active)
+            active_em_hit = active & (emitter_hit != None)
+            ds = mi.DirectionSample3f(scene, si=si, ref=prev_si)
+            em_pdf = scene.pdf_emitter_direction(prev_si, ds, active_em_hit & ~prev_delta)
+            w_bsdf = mis_weight(prev_pdf, em_pdf)
             # if dr.any(active & (emitter_hit != None)): result += throughput * emitter_hit.eval(si, active)
-            result += dr.select(active & (emitter_hit != None),
-                                throughput * emitter_hit.eval(si, active),
+            result += dr.select(active_em_hit,
+                                throughput * w_bsdf * emitter_hit.eval(si, active),
                                 mi.Spectrum(0.0)
                                 )
             
@@ -407,11 +426,18 @@ class RLIntegrator(mi.SamplingIntegrator):
                 # throughput update (f * cos / pdf_mix) -- cosine term already included
                 weight = dr.select(pdf_mix > 1e-7, bsdf.eval(ctx, si, wo_local, active) / pdf_mix, 0.0)
                 throughput *= dr.select(alpha > 0, weight, bs_w)
-                
+
                 prev_idx, prev_dir, has_prev = curr_idx, direction, active & (dr.any(throughput > 0.0))
+                bsdf_delta = mi.has_flag(bs_s.sampled_type, mi.BSDFFlags.Delta)
+                prev_pdf = dr.select(alpha > 0, pdf_mix, bs_s.pdf)
+                prev_delta = dr.select(alpha > 0, mi.Bool(False), bsdf_delta)
+                prev_si = si
             else:
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
                 direction, throughput, has_prev = si.to_world(bs_s.wo), throughput * bs_w, dr.full(mi.Bool, False, dr.width(active))
+                prev_pdf = bs_s.pdf
+                prev_delta = mi.has_flag(bs_s.sampled_type, mi.BSDFFlags.Delta)
+                prev_si = si
 
             ray = si.spawn_ray(direction)
             active = active & (mi.luminance(throughput) > 0.0)
