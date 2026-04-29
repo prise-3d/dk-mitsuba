@@ -63,16 +63,20 @@ class SurfaceIrradianceVolume:
             min_dist2, best_indices = dr.select(is_closer, d2, min_dist2), dr.select(is_closer, mi.UInt32(i), best_indices)
         self.grid_data = best_indices
 
-    def nearest_point(self, p, n):        
+    def nearest_point(self, p, n, threshold=0.5):
         """
         Finds the nearest surface point index using a spatial grid. O(1) complexity.
+        Returns (idx, valid) where valid is True iff the probe normal aligns with n.
         """
         p_rel = (p - self.grid_min) / self.grid_size
         ix = dr.clip(mi.UInt32(p_rel.x * self.grid_res), 0, self.grid_res - 1)
         iy = dr.clip(mi.UInt32(p_rel.y * self.grid_res), 0, self.grid_res - 1)
         iz = dr.clip(mi.UInt32(p_rel.z * self.grid_res), 0, self.grid_res - 1)
         idx = ix + iy * self.grid_res + iz * (self.grid_res**2)
-        return dr.gather(mi.UInt32, self.grid_data, idx)
+        probe_idx = dr.gather(mi.UInt32, self.grid_data, idx)
+        probe_n = dr.gather(mi.Vector3f, self.normals, probe_idx)
+        valid = dr.dot(n, probe_n) > threshold
+        return probe_idx, valid
 
     def update(self, spatial_indices, frame_n, directions, rewards, active):
         """
@@ -355,6 +359,7 @@ class RLIntegrator(mi.SamplingIntegrator):
         
         prev_si = dr.zeros(mi.SurfaceInteraction3f)
         prev_frame_n = mi.Vector3f(0, 0, 1)
+        prev_valid = mi.Bool(False)
 
         for _ in range(8):
             si = scene.ray_intersect(ray, active)
@@ -383,12 +388,16 @@ class RLIntegrator(mi.SamplingIntegrator):
                 result += throughput * w_nee * nee_contrib_val
 
             # Optimisation : on cherche l'index de la sonde UNE SEULE FOIS par intersection
-            curr_idx = self.volume.nearest_point(si.p, si.n) if self.enable_guiding else dr.zeros(mi.UInt32, dr.width(active))
+            if self.enable_guiding:
+                curr_idx, curr_valid = self.volume.nearest_point(si.p, si.sh_frame.n)
+            else:
+                curr_idx = dr.zeros(mi.UInt32, dr.width(active))
+                curr_valid = mi.Bool(False)
 
             # update the Q-values based on the previous action 
             if self.update_q and self.enable_guiding:
                 # on the first bounce, has_prev is all False, propagated to volume.update through active_up
-                active_up = has_prev & si.is_valid()
+                active_up = has_prev & si.is_valid() & prev_valid & curr_valid
                 emitter = si.emitter(scene, active_up)
                 L_dir = dr.select(emitter != None, emitter.eval(si, active_up), 0.0)
                 L_ind = dr.select(emitter == None, bsdf.eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx), 0.0)
@@ -410,8 +419,7 @@ class RLIntegrator(mi.SamplingIntegrator):
             if self.enable_guiding:
                 # Probabilité de guidage (alpha)
                 # On vérifie l'alignement des normales pour éviter le guidage "à travers" les murs
-                dot_n = dr.dot(si.n, dr.gather(mi.Vector3f, self.volume.normals, curr_idx))
-                alpha = dr.select((dot_n > 0.5) & (self.volume.get_total_visits(curr_idx) > 50), 0.4, 0.0)
+                alpha = dr.select(curr_valid & (self.volume.get_total_visits(curr_idx) > 50), 0.4, 0.0)
                 
                 # Tirage de la direction (RL ou BSDF)
                 wo_rl, _ = self.volume.sample_direction(curr_idx, si.sh_frame.n, sampler.next_2d(active))
@@ -436,6 +444,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                 prev_delta = dr.select(alpha > 0, mi.Bool(False), bsdf_delta)
                 prev_si = si
                 prev_frame_n = si.sh_frame.n
+                prev_valid = curr_valid
             else:
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
                 direction, throughput, has_prev = si.to_world(bs_s.wo), throughput * bs_w, dr.full(mi.Bool, False, dr.width(active))
@@ -443,6 +452,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                 prev_delta = mi.has_flag(bs_s.sampled_type, mi.BSDFFlags.Delta)
                 prev_frame_n = si.sh_frame.n
                 prev_si = si
+                prev_valid = curr_valid
 
             ray = si.spawn_ray(direction)
             active = active & (mi.luminance(throughput) > 0.0)
