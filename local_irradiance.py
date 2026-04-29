@@ -147,6 +147,9 @@ class SurfaceIrradianceVolume:
         prev_c = dr.zeros(mi.Float, dr.width(sample_x))
         for i in range(self.n_bins_per_point): prev_c = dr.select(bin_idx == i, (cum_w[i-1] if i > 0 else 0.0), prev_c)
 
+        # dr.gather(dr.concat(cum_w), bin_idx) returns concat[bin_idx[k]],                                                                                                       
+        # not cum_w[bin_idx[k]][k]. Both only coincides for width=1, which is
+        # why unit tests did not catch the problem in the first place
         cur_c = dr.zeros(mi.Float, dr.width(sample_x))
         for i in range(self.n_bins_per_point): cur_c = dr.select(bin_idx == i, cum_w[i], cur_c)
 
@@ -390,7 +393,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                 L_dir = dr.select(emitter != None, emitter.eval(si, active_up), 0.0)
                 L_ind = dr.select(emitter == None, bsdf.eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx), 0.0)
                 # Le reward est la radiance sortante de si (émise + réfléchie)
-                self.volume.update(prev_idx, prev_frame_n, prev_dir, L_dir + nee_contrib_val + L_ind, active_up)
+                self.volume.update(prev_idx, prev_frame_n, prev_dir, L_dir + L_ind, active_up)
 
             emitter_hit = si.emitter(scene, active)
             active_em_hit = active & (emitter_hit != None)
