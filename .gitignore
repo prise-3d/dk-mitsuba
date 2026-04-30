@@ -1,0 +1,6 @@
+test/
+ply/
+__pycache__/
+*.ply
+*.png
+*.exr

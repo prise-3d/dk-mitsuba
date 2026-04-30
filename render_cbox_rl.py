@@ -49,7 +49,7 @@ class CornellBoxRenderer:
         integrator = mi.load_dict(integrator_dict)
 
         # Split SPP into multiple passes
-        n_passes = 16
+        n_passes = 4
         spp_per_pass = max(1, spp // n_passes)
         
         image = None
@@ -105,7 +105,7 @@ if __name__ == "__main__":
     renderer = CornellBoxRenderer(n_probes=1024)
 
     # Run the rendering process
-    spp = 32
+    spp = 64
 
     format = "exr"
     output_dir = "render_results"
