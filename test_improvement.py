@@ -15,7 +15,8 @@ def calculate_mse(img1, img2):
 
 @pytest.fixture
 def scene():
-    scene_path = 'scenes/cbox/cbox.xml'
+    #scene_path = 'scenes/cbox/cbox.xml'
+    scene_path = 'scenes/corridor/corridor.xml'
     if not os.path.exists(scene_path):
         pytest.skip("Scene file not found")
     scene = mi.load_file(scene_path)
