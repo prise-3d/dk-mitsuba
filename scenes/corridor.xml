@@ -1,0 +1,297 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+================================================================================
+  Inspired by Figure 3 of:
+    Dahm & Keller, "Learning Light Transport the Reinforced Way"
+    arXiv:1701.07403
+================================================================================
+
+  GEOMETRY
+  --------
+  A long corridor split lengthwise by a partial dividing wall into two
+  narrower sub-corridors. The dividing wall does NOT span the full length
+  of the main corridor: a gap at the camera-side end lets the two halves
+  communicate. The camera stands in that gap and looks toward the closed
+  end. A small area light is placed at the closed end of one sub-corridor.
+  The other sub-corridor is therefore lit almost exclusively by indirect
+  bounces — light has to travel down the lit side, around the wall edge
+  near the camera, and back into the dark side.
+
+  COORDINATE CONVENTION (Y up, right-handed)
+    x : transverse axis (corridor width)
+    y : vertical
+    z : longitudinal axis (corridor length); camera looks toward +z
+    main corridor :  x in [-2, +2]   y in [0, 3]   z in [-6, +6]
+    dividing wall :  x =  0          y in [0, 3]   z in [-3, +6]
+                     gap is z in [-6, -3], at the camera end
+    light         :  on the back wall (z = +6), in the right sub-corridor
+
+  IMAGE/WORLD MIRRORING
+    With this lookat (forward = +z, up = +y), image-right maps to world -x.
+    So the world-right sub-corridor (x > 0) — where the light sits — appears
+    on the LEFT half of the rendered image, and vice versa. To swap, negate
+    the x of the light's <translate>.
+
+  MITSUBA SHAPE DEFAULTS
+    <shape type="rectangle"/> : two-sided unit square in the XY plane,
+                                vertices (+/-1, +/-1, 0), normal +z.
+    <shape type="cube"/>      : axis-aligned cube spanning [-1, +1]^3.
+
+  TRANSFORM ORDER
+    Inside a <transform>, operations are applied to local-space points in
+    TEXTUAL ORDER (top first). So "scale, then rotate, then translate" is
+    written in that order.
+
+  KEY KNOBS (search for "TWEAK")
+    * camera origin / target / fov           — composition
+    * light position / size / radiance       — illumination level
+    * max_depth                              — must stay high (>= 12) for
+                                               the indirect side to converge
+    * spp / resx / resy                      — quality vs speed
+================================================================================
+-->
+<scene version="3.0.0">
+
+    <!-- ============================================================
+         Render-time defaults. Override from Python via:
+             mi.load_file('scenes/rl_fig3.xml',
+                          spp=512, resx=1280, resy=960, max_depth=24)
+         ============================================================ -->
+    <default name="spp"       value="64"/>     <!-- samples per pixel -->
+    <default name="resx"      value="640"/>
+    <default name="resy"      value="480"/>
+    <default name="max_depth" value="16"/>     <!-- TWEAK: lower => dark side stays black -->
+
+    <!-- Standard unidirectional path tracer (no MIS knobs to set here;
+         "path" already does NEE + BSDF sampling with MIS internally). -->
+    <integrator type="path">
+        <integer name="max_depth" value="$max_depth"/>
+    </integrator>
+
+    <!-- ============================================================
+         CAMERA
+         ============================================================
+         lookat: origin = eye position, target = point looked at.
+         fov is along the X axis (horizontal); fov_axis="y" or "smaller"
+         are the alternatives. Aspect ratio comes from resx/resy.
+         ============================================================ -->
+    <sensor type="perspective">
+        <string name="fov_axis" value="x"/>
+        <float  name="fov"       value="55"/>          <!-- TWEAK: composition -->
+        <float  name="near_clip" value="0.05"/>
+        <float  name="far_clip"  value="100"/>
+        <transform name="to_world">
+            <!-- TWEAK camera placement here.
+                 origin x=0 puts the eye exactly on the dividing-wall plane,
+                 so the wall renders as a thin vertical line dead center
+                 (it is edge-on). Shift x slightly (e.g. -0.4) to push the
+                 wall toward one side of the frame. -->
+            <lookat origin="0, 2.2, -2.9"
+                    target="0, -1.5,  2.5"
+                    up    ="0, 1,    0"/>
+
+                <!-- <lookat origin="0, 2.2, -4.9"
+                    target="0, 1.5,  5.5"
+                    up    ="0, 1,    0"/> -->
+        </transform>
+
+        <sampler type="independent">
+            <integer name="sample_count" value="$spp"/>
+        </sampler>
+
+        <film type="hdrfilm">
+            <integer name="width"  value="$resx"/>
+            <integer name="height" value="$resy"/>
+            <rfilter type="gaussian"/>
+        </film>
+    </sensor>
+
+    <!-- ============================================================
+         MATERIALS
+         ============================================================ -->
+
+    <!-- Walls / ceiling : neutral diffuse. RGB reflectance must stay <= 1. -->
+    <bsdf type="diffuse" id="white">
+        <rgb name="reflectance" value="0.72, 0.72, 0.70"/>
+    </bsdf>
+
+    <!-- Dividing wall : a touch darker so its edge stays readable
+         against the back wall in the rendered image. -->
+    <bsdf type="diffuse" id="lightgray">
+        <rgb name="reflectance" value="0.55, 0.55, 0.55"/>
+    </bsdf>
+
+    <!-- Procedural checkerboard for the floor.
+         color0/color1 are the two tile colors, to_uv scales the UV grid:
+             scale x=3 y=9  =>  3 tiles across the width, 9 along the length. -->
+    <bsdf type="diffuse" id="checker_floor">
+        <texture type="checkerboard" name="reflectance">
+            <rgb name="color0" value="0.92, 0.92, 0.92"/>
+            <rgb name="color1" value="0.04, 0.04, 0.04"/>
+            <transform name="to_uv">
+                <scale x="18" y="54"/>          <!-- TWEAK: tile density -->
+            </transform>
+        </texture>
+    </bsdf>
+
+    <!-- ============================================================
+         MAIN CORRIDOR SHELL (6 rectangles)
+         ============================================================
+         Each wall is built from a unit rectangle (XY plane, normal +z)
+         transformed in 3 steps:
+            1) scale   : sets half-extents along X and Y of the unit square
+            2) rotate  : reorients the normal toward the desired direction
+            3) translate: moves the wall into place
+         ============================================================ -->
+
+    <!-- FLOOR (y = 0). Half-extents: 2 along x, 6 along z. Normal +y. -->
+    <shape type="rectangle">
+        <ref id="checker_floor"/>
+        <transform name="to_world">
+            <scale  x="2" y="6" z="1"/>           <!-- size 4 (x) x 12 (z) -->
+            <rotate x="1" angle="-90"/>           <!-- +z normal -> +y -->
+        </transform>
+    </shape>
+
+    <!-- CEILING (y = 3). Same footprint as the floor, normal -y. -->
+    <shape type="rectangle">
+        <ref id="white"/>
+        <transform name="to_world">
+            <scale     x="2" y="6" z="1"/>
+            <rotate    x="1" angle="90"/>         <!-- +z normal -> -y -->
+            <translate y="3"/>
+        </transform>
+    </shape>
+
+    <!-- FRONT WALL (z = -3, behind the camera). Normal +z (default). -->
+    <shape type="rectangle">
+        <ref id="white"/>
+        <transform name="to_world">
+            <scale     x="2" y="1.5" z="1"/>      <!-- size 4 (x) x 3 (y) -->
+            <translate y="1.5" z="-3"/>
+        </transform>
+    </shape>
+
+    <!-- BACK WALL (z = +6, the closed end). Normal -z. -->
+    <shape type="rectangle">
+        <ref id="white"/>
+        <transform name="to_world">
+            <scale     x="2" y="1.5" z="1"/>
+            <rotate    y="1" angle="180"/>        <!-- +z normal -> -z -->
+            <translate y="1.5" z="6"/>
+        </transform>
+    </shape>
+
+    <!-- LEFT WALL (x = -2). Normal +x.
+         Note the scale is along original X (which after the +90 rotation
+         around Y becomes the world Z extent, hence x=6 -> length 12). -->
+    <shape type="rectangle">
+        <ref id="white"/>
+        <transform name="to_world">
+            <scale     x="6" y="1.5" z="1"/>      <!-- length 12 along z, height 3 -->
+            <rotate    y="1" angle="90"/>         <!-- +z normal -> +x -->
+            <translate x="-2" y="1.5"/>
+        </transform>
+    </shape>
+
+    <!-- RIGHT WALL (x = +2). Normal -x. -->
+    <shape type="rectangle">
+        <ref id="white"/>
+        <transform name="to_world">
+            <scale     x="6" y="1.5" z="1"/>
+            <rotate    y="1" angle="-90"/>        <!-- +z normal -> -x -->
+            <translate x="2" y="1.5"/>
+        </transform>
+    </shape>
+
+    <!-- ============================================================
+         PARTIAL DIVIDING WALL (with thickness)
+         ============================================================
+         The wall has a small thickness along x and is built from three
+         rectangles:
+           1) right face : x = +0.2, normal +x  (faces lit corridor)
+           2) left  face : x = -0.2, normal -x  (faces dark corridor)
+           3) end cap    : z = -3,    normal -z   (visible from camera)
+
+         Length & height : z in [-3, +6] (length 9), y in [0, 3].
+         Thickness       : 0.2 along x (half-thickness 0.2).
+         The other end (z = +6) sits flush against the back wall, so no
+         cap is needed there.
+
+         To change the gap length, edit the X scale of faces 1 & 2 AND
+         the Z translate. With the values below:
+             scale x=4.5      -> length 9 along z
+             translate z=1.5  -> centered at z=+1.5, so spans [-3, +6]
+         To make the gap larger, reduce X scale and increase Z translate.
+
+         To change the wall thickness, edit ALL FOUR places marked
+         "WALL_T": the +/-0.2 in faces 1 & 2 translate, AND the
+         scale x=0.2 of the end cap (face 3). The end cap's X scale
+         must equal the half-thickness (the cap is 2*half-thickness wide).
+         ============================================================ -->
+
+    <!-- Face 1 : right side of wall (normal +x, faces x > +0.2) -->
+    <shape type="rectangle">
+        <ref id="lightgray"/>
+        <transform name="to_world">
+            <scale     x="3.5" y="1.5" z="1"/>          <!-- TWEAK: half-length along z, half-height along y -->
+            <rotate    y="1"   angle="90"/>             <!-- +z normal -> +x -->
+            <translate x="0.2" y="1.5" z="2.5"/>      <!-- WALL_T: +half-thickness; TWEAK z to slide the gap -->
+        </transform>
+    </shape>
+
+    <!-- Face 2 : left side of wall (normal -x, faces x < -0.2) -->
+    <shape type="rectangle">
+        <ref id="lightgray"/>
+        <transform name="to_world">
+            <scale     x="3.5" y="1.5" z="1"/>
+            <rotate    y="1"   angle="-90"/>            <!-- +z normal -> -x -->
+            <translate x="-0.2" y="1.5" z="2.5"/>     <!-- WALL_T: -half-thickness -->
+        </transform>
+    </shape>
+
+    <!-- Face 3 : end cap facing the camera (normal -z, at z = -3) -->
+    <shape type="rectangle">
+        <ref id="lightgray"/>
+        <transform name="to_world">
+            <scale     x="0.2" y="1.5" z="1"/>        <!-- WALL_T: width = 2*half-thickness, height = 3 -->
+            <rotate    y="1" angle="180"/>              <!-- +z normal -> -z -->
+            <translate y="1.5" z="-1"/>
+        </transform>
+    </shape>
+
+    <!-- ============================================================
+         AREA LIGHT
+         ============================================================
+         A small emissive rectangle mounted on the back wall, centered
+         in the right sub-corridor. Black diffuse BSDF underneath so the
+         light only emits (no reflection from its own face).
+
+         Position breakdown:
+             scale     x=0.5 y=0.3  -> emitter is 1.0 wide x 0.6 tall
+             rotate    y=180       -> faces -z (toward the camera)
+             translate x=+1.0      -> centered in right sub-corridor (x>0)
+                       y=+1.5      -> mid-height
+                       z=+5.99     -> just inside the back wall (z=+6)
+
+         To put the light in the OTHER sub-corridor, change the x of the
+         translate to a negative value (e.g. x="-1.0").
+         To brighten/dim, scale the radiance triplet uniformly.
+         ============================================================ -->
+    <shape type="rectangle">
+        <transform name="to_world">
+            <scale     x="0.6" y="1.2" z="1"/>    <!-- TWEAK: light size -->
+            <rotate    y="1"   angle="180"/>      <!-- emit toward -z -->
+            <translate x="1.0" y="1.5" z="5.99"/> <!-- TWEAK: light position -->
+        </transform>
+        <emitter type="area">
+            <!-- Radiance in W / (m^2 * sr * unit_wavelength). Slightly
+                 warm (R > B). Multiply all three by k to scale exposure. -->
+            <rgb name="radiance" value="9, 9, 9"/>   <!-- TWEAK: brightness -->
+        </emitter>
+        <bsdf type="diffuse">
+            <rgb name="reflectance" value="0.0"/>
+        </bsdf>
+    </shape>
+
+</scene>
