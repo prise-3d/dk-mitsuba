@@ -2,6 +2,9 @@ import drjit as dr
 import mitsuba as mi
 import numpy as np
 
+def mis_weight(pdf_a, pdf_b):
+    return dr.select(pdf_a > 0, pdf_a / (pdf_a + pdf_b), 0)
+
 class SurfaceIrradianceVolume:
     """
     A class that maintains a volume of irradiance estimates at sampled surface points in the scene,
@@ -60,27 +63,31 @@ class SurfaceIrradianceVolume:
             min_dist2, best_indices = dr.select(is_closer, d2, min_dist2), dr.select(is_closer, mi.UInt32(i), best_indices)
         self.grid_data = best_indices
 
-    def nearest_point(self, p, n):        
+    def nearest_point(self, p, n, threshold=0.5):
         """
         Finds the nearest surface point index using a spatial grid. O(1) complexity.
+        Returns (idx, valid) where valid is True iff the probe normal aligns with n.
         """
         p_rel = (p - self.grid_min) / self.grid_size
         ix = dr.clip(mi.UInt32(p_rel.x * self.grid_res), 0, self.grid_res - 1)
         iy = dr.clip(mi.UInt32(p_rel.y * self.grid_res), 0, self.grid_res - 1)
         iz = dr.clip(mi.UInt32(p_rel.z * self.grid_res), 0, self.grid_res - 1)
         idx = ix + iy * self.grid_res + iz * (self.grid_res**2)
-        return dr.gather(mi.UInt32, self.grid_data, idx)
+        probe_idx = dr.gather(mi.UInt32, self.grid_data, idx)
+        probe_n = dr.gather(mi.Vector3f, self.normals, probe_idx)
+        valid = dr.dot(n, probe_n) > threshold
+        return probe_idx, valid
 
-    def update(self, spatial_indices, directions, rewards, active):
+    def update(self, spatial_indices, frame_n, directions, rewards, active):
         """
         Updates the Q-values for the given spatial indices, directions, and rewards based on the observed samples.
         Input: - spatial_indices: The indices of the surface points corresponding to the samples.
                - directions: The world-space direction vectors of the samples.
                - rewards: The observed rewards (radiance) for the samples, as a Color3f.
                - active: A boolean mask indicating which samples are active and should be updated.
-        """   
-        n = dr.gather(mi.Vector3f, self.normals, spatial_indices)
-        w_l = mi.Frame3f(n).to_local(directions)
+        """
+        w_l = mi.Frame3f(frame_n).to_local(directions)
+        active = active & (w_l.z > 0)
         phi = dr.atan2(w_l.y, w_l.x)
         u_idx = dr.minimum(mi.UInt32((phi / (2*dr.pi) + dr.select(phi < 0, 1.0, 0.0)) * self.res_u), self.res_u - 1)
         v_idx = dr.minimum(mi.UInt32(dr.clip(w_l.z, 0.0, 1.0) * self.res_v), self.res_v - 1)
@@ -109,24 +116,20 @@ class SurfaceIrradianceVolume:
         for i, q in enumerate(all_q): res += q * self.bin_cosines[i]
         return mi.luminance(res)
 
-    def _compute_weights(self, spatial_indices, epsilon=0.1):
+    def _compute_weights(self, spatial_indices, threshold=0.05):
         """
-        Computes the probability weights for each bin using an epsilon-greedy strategy.
-        Reference: Dahm & Keller (2017), Eq. (5) - Probability distribution P_i
+        Computes the probability weights for each bin proportional to Q*f_s*cos
+        with a positive threshold clamp on Q for ergodicity.
+        Reference: Dahm & Keller (2017), Section 3.1.
         """
         all_q = self.get_q_data(spatial_indices)
-        q_cos = [mi.luminance(q) * self.bin_cosines[i] for i, q in enumerate(all_q)]
-        
+        q_lum = [dr.maximum(mi.luminance(q), threshold) for q in all_q]
+        q_cos = [q_lum[i] * self.bin_cosines[i] for i in range(self.n_bins_per_point)]
+
         q_sum = dr.zeros(mi.Float, dr.width(spatial_indices))
         for val in q_cos: q_sum += val
 
-        # Mix learned distribution with uniform distribution for exploration
-        weights = [
-            dr.select(q_sum > 1e-6, 
-                      (1.0 - epsilon) * q_c / q_sum + epsilon / self.n_bins_per_point, 
-                      1.0 / self.n_bins_per_point) 
-            for q_c in q_cos
-        ]
+        weights = [q_c / q_sum for q_c in q_cos]
         return weights
 
     def _sample_bin_discrete(self, weights, sample_x):
@@ -135,7 +138,9 @@ class SurfaceIrradianceVolume:
         Reference: Dahm & Keller (2017), Section 3.1 - Sampling the piece-wise constant PDF.
         """
         cum_w, curr = [], dr.zeros(mi.Float, dr.width(sample_x))
-        for w in weights: curr += w; cum_w.append(curr)
+        for w in weights:
+            curr = curr + w
+            cum_w.append(curr)
 
         bin_idx = dr.zeros(mi.UInt32, dr.width(sample_x))
         for i in range(self.n_bins_per_point - 1):
@@ -143,14 +148,20 @@ class SurfaceIrradianceVolume:
 
         prev_c = dr.zeros(mi.Float, dr.width(sample_x))
         for i in range(self.n_bins_per_point): prev_c = dr.select(bin_idx == i, (cum_w[i-1] if i > 0 else 0.0), prev_c)
-        
+
+        # dr.gather(dr.concat(cum_w), bin_idx) returns concat[bin_idx[k]],                                                                                                       
+        # not cum_w[bin_idx[k]][k]. Both only coincides for width=1, which is
+        # why unit tests did not catch the problem in the first place
+        cur_c = dr.zeros(mi.Float, dr.width(sample_x))
+        for i in range(self.n_bins_per_point): cur_c = dr.select(bin_idx == i, cum_w[i], cur_c)
+
         # Calculate relative position within the bin for continuous sampling
-        bin_width = dr.maximum(dr.gather(mi.Float, dr.concat(cum_w), bin_idx) - prev_c, 1e-7)
+        bin_width = dr.maximum(cur_c - prev_c, 1e-7)
         u_local = dr.clip((sample_x - prev_c) / bin_width, 0.0, 1.0)
         
         return bin_idx, u_local
 
-    def _map_to_world_direction(self, spatial_indices, bin_idx, u_l, sample_y):
+    def _map_to_world_direction(self, spatial_indices, frame_n, bin_idx, u_l, sample_y):
         """
         Maps the selected bin and continuous samples to a world-space direction vector.
         Reference: Dahm & Keller (2017), Section 3.1 - Spatial and Directional Discretization.
@@ -158,11 +169,11 @@ class SurfaceIrradianceVolume:
         phi = (mi.Float(bin_idx % self.res_u) + u_l) * (2 * dr.pi / self.res_u)
         cos_theta = dr.clip((mi.Float(bin_idx // self.res_u) + sample_y) / self.res_v, 0.0, 1.0)
         sin_theta = dr.safe_sqrt(1.0 - cos_theta * cos_theta)
-        
-        local_dir = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
-        return mi.Frame3f(dr.gather(mi.Vector3f, self.normals, spatial_indices)).to_world(local_dir)
 
-    def sample_direction(self, spatial_indices, sample):
+        local_dir = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
+        return mi.Frame3f(frame_n).to_world(local_dir)
+
+    def sample_direction(self, spatial_indices, frame_n, sample):
         """Samples a direction based on the learned Q-values and returns the corresponding PDF.
         Input: - spatial_indices: The indices of the surface points for which to sample directions.
                - sample: A 2D sample (sample.x, sample.y) in the range [0, 1] used for sampling the bin and the local offset.
@@ -171,13 +182,13 @@ class SurfaceIrradianceVolume:
         """
         weights = self._compute_weights(spatial_indices)
         bin_idx, u_l = self._sample_bin_discrete(weights, sample.x)
-        direction = self._map_to_world_direction(spatial_indices, bin_idx, u_l, sample.y)
+        direction = self._map_to_world_direction(spatial_indices, frame_n, bin_idx, u_l, sample.y)
 
         pdf = dr.zeros(mi.Float, dr.width(spatial_indices))
         for i in range(self.n_bins_per_point): pdf = dr.select(bin_idx == i, weights[i], pdf)
         return direction, pdf * (self.n_bins_per_point / (2 * dr.pi))
 
-    def pdf_direction(self, spatial_indices, directions):
+    def pdf_direction(self, spatial_indices, frame_n, directions):
         """Computes the PDF for given directions based on the learned Q-values.
         Input: - spatial_indices: The indices of the surface points for which to compute the PDF.
                - directions: The world-space direction vectors for which to compute the PDF.
@@ -185,8 +196,7 @@ class SurfaceIrradianceVolume:
         weights = self._compute_weights(spatial_indices)
 
         # Determine which bin the given directions fall into
-        n = dr.gather(mi.Vector3f, self.normals, spatial_indices)
-        w_l = mi.Frame3f(n).to_local(directions)
+        w_l = mi.Frame3f(frame_n).to_local(directions)
         phi = dr.atan2(w_l.y, w_l.x)
         u_idx = dr.minimum(mi.UInt32((phi / (2*dr.pi) + dr.select(phi < 0, 1.0, 0.0)) * self.res_u), self.res_u - 1)
         v_idx = dr.minimum(mi.UInt32(dr.clip(w_l.z, 0.0, 1.0) * self.res_v), self.res_v - 1)
@@ -240,33 +250,66 @@ class SurfaceIrradianceVolume:
             f.write("end_header\n")
 
             # Write vertices for each bin direction, colored by the Q-values
+            # Represent every vertex needed later
+            total      = n_points * n_bins * 4
+            lane       = dr.arange(mi.UInt32, total)
+            probe_idx  = lane // (n_bins * 4)
+            bin_idx    = (lane // 4) % n_bins
+            corner_idx = lane % 4
 
-            for i in range(n_points):
-                p = dr.gather(mi.Point3f, self.positions, i)
-                n = dr.gather(mi.Vector3f, self.normals, i)
-                q_list = self.get_q_data(i)
-                frame = mi.Frame3f(n)
-                for j in range(n_bins):
-                    q = q_list[j]
-                    r, g, b = q.x[0], q.y[0], q.z[0]
-                    u_idx, v_idx = j % res_u, j // res_u
-                    for du, dv in [(0, 0), (1, 0), (1, 1), (0, 1)]:
-                        phi = (u_idx + du) * (2 * dr.pi / res_u)
-                        cos_theta = dr.clip((v_idx + dv) / res_v, 0.0, 1.0)
-                        sin_theta = dr.safe_sqrt(1.0 - cos_theta * cos_theta)
-                        local_dir = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
-                        v_pos = p + frame.to_world(local_dir) * radius
-                        f.write(f"{v_pos.x[0]} {v_pos.y[0]} {v_pos.z[0]} {r} {g} {b}\n")
+            # compute corner offsets w/ DrJit
+            du = dr.select((corner_idx == 1) | (corner_idx == 2), 1, 0)                                                                                                            
+            dv = dr.select(corner_idx >= 2, 1, 0)
 
-            # Write faces for the quads                        
+            # build the local direction in w/ DrJit
+            u_idx     = bin_idx %  res_u                                                                                                                                               
+            v_idx     = bin_idx // res_u                                                                                                                                               
+            phi       = mi.Float(u_idx + du) * (2 * dr.pi / res_u)
+            cos_theta = dr.clip(mi.Float(v_idx + dv) / res_v, 0.0, 1.0)                                                                                                            
+            sin_theta = dr.safe_sqrt(1.0 - cos_theta * cos_theta)                                                                                                                  
+            local_dir = mi.Vector3f(sin_theta * dr.cos(phi),                                                                                                                       
+                                    sin_theta * dr.sin(phi),                                                                                                                       
+                                    cos_theta)
+            
+            # gather positions, normals and colors per lane
+            p  = dr.gather(mi.Point3f,  self.positions, probe_idx)                                                                                                                 
+            n  = dr.gather(mi.Vector3f, self.normals,   probe_idx)
+                                                                                                                                                                                    
+            flat_pb = probe_idx * n_bins + bin_idx        # bin slot in the SoA Q arrays                                                                                           
+            counts  = dr.maximum(dr.gather(mi.Float, self.visit_counts, flat_pb), 1.0)                                                                                             
+            r       = dr.gather(mi.Float, self.sum_r, flat_pb) / counts                                                                                                                  
+            g       = dr.gather(mi.Float, self.sum_g, flat_pb) / counts                                                                                                                  
+            b       = dr.gather(mi.Float, self.sum_b, flat_pb) / counts
 
-            for i in range(n_points):
-                q_list = self.get_q_data(i)
-                for j in range(n_bins):
-                    q = q_list[j]
-                    r, g, b = dr.clip(q.x[0], 0, 1), dr.clip(q.y[0], 0, 1), dr.clip(q.z[0], 0, 1)
-                    idx = i * n_bins + j
-                    f.write(f"4 {idx*4} {idx*4+1} {idx*4+2} {idx*4+3} {int(r*255)} {int(g*255)} {int(b*255)}\n")
+            # compute the frame
+            v_pos = p + mi.Frame3f(n).to_world(local_dir) * radius
+
+            # sync to numpy
+            xyz   = np.asarray(v_pos).T          # shape (total, 3)                                                                                                                  
+            rs    = np.asarray(r)                # shape (total,)
+            gs    = np.asarray(g)                                                                                                                                                    
+            bs    = np.asarray(b)
+            verts = np.column_stack([xyz, rs, gs, bs])   # shape (total, 6)
+
+            # stream vertices
+            np.savetxt(f, verts, fmt="%g %g %g %g %g %g")
+
+            # ~ Same thing, for the faces
+            n_faces     = n_points * n_bins # 1 row per (probe, bin)
+            face_lane   = dr.arange(mi.UInt32, n_faces)
+            flat_pb_f   = face_lane                                                                            
+            counts_f    = dr.maximum(dr.gather(mi.Float, self.visit_counts, flat_pb_f), 1.0)                                                                                       
+            rf = dr.clip(dr.gather(mi.Float, self.sum_r, flat_pb_f) / counts_f, 0.0, 1.0)                                                                                          
+            gf = dr.clip(dr.gather(mi.Float, self.sum_g, flat_pb_f) / counts_f, 0.0, 1.0)                                                                                          
+            bf = dr.clip(dr.gather(mi.Float, self.sum_b, flat_pb_f) / counts_f, 0.0, 1.0)
+            
+            R     = (np.asarray(rf) * 255).astype(np.int32)                                                                                                                            
+            G     = (np.asarray(gf) * 255).astype(np.int32)                                                                                                                            
+            B     = (np.asarray(bf) * 255).astype(np.int32)
+            v0    = np.arange(n_faces, dtype=np.int32) * 4                                                                                                                         
+            fours = np.full(n_faces, 4, dtype=np.int32)
+            faces = np.column_stack([fours, v0, v0 + 1, v0 + 2, v0 + 3, R, G, B])                                                                                                        
+            np.savetxt(f, faces, fmt="%d")
 
 class RLIntegrator(mi.SamplingIntegrator):
     """
@@ -303,8 +346,20 @@ class RLIntegrator(mi.SamplingIntegrator):
             )
             
         throughput, result = mi.Spectrum(1.0), mi.Spectrum(0.0)
-        prev_idx, prev_dir, has_prev, depth = dr.zeros(mi.UInt32, dr.width(active)), mi.Vector3f(0.0), dr.full(mi.Bool, False, dr.width(active)), 0
-        while dr.any(active) and depth < 8:
+
+        prev_idx, prev_dir, has_prev = dr.zeros(mi.UInt32, dr.width(active)),mi.Vector3f(0.0), dr.full(mi.Bool, False, dr.width(active))
+
+        # solid angle pdf used to generate a ray
+        prev_pdf = mi.Float(1.0)
+
+        # was the previous sample a specular reflection?
+        prev_delta = mi.Bool(True)
+        
+        prev_si = dr.zeros(mi.SurfaceInteraction3f)
+        prev_frame_n = mi.Vector3f(0, 0, 1)
+        prev_valid = mi.Bool(False)
+
+        for _ in range(8):
             si = scene.ray_intersect(ray, active)
             active &= si.is_valid()
             
@@ -312,46 +367,63 @@ class RLIntegrator(mi.SamplingIntegrator):
             bsdf = si.bsdf(ray)
             ctx = mi.BSDFContext()
 
-            # Next Event Estimation (NEE)
-            if dr.any(active) and self.next_event_estimation:
-                emitter_sample, emitter_weight = scene.sample_emitter_direction(si, sampler.next_2d(active), True, active)
-                active_nee = active & (mi.luminance(emitter_weight) > 0)
-                if dr.any(active_nee):
-                    wo_nee = si.to_local(emitter_sample.d)
-                    # le cosinus local est obligatoire ici ?
-                    cos_nee = dr.maximum(0.0, wo_nee.z)
-                    shadow_ray = si.spawn_ray_to(emitter_sample.p)
-                    occluded = scene.ray_test(shadow_ray, active_nee)
-                    nee_contrib_val = dr.select(active_nee & ~occluded, emitter_weight * bsdf.eval(ctx, si, wo_nee, active_nee) * cos_nee, 0.0)
-                    result += throughput * nee_contrib_val
-
             # Optimisation : on cherche l'index de la sonde UNE SEULE FOIS par intersection
-            curr_idx = self.volume.nearest_point(si.p, si.n) if self.enable_guiding else dr.zeros(mi.UInt32, dr.width(active))
+            if self.enable_guiding:
+                curr_idx, curr_valid = self.volume.nearest_point(si.p, si.sh_frame.n)
+                alpha = dr.select(curr_valid & (self.volume.get_total_visits(curr_idx) > 50), 1.0, 0.0)
+            else:
+                curr_idx = dr.zeros(mi.UInt32, dr.width(active))
+                curr_valid = mi.Bool(False)
+                alpha = mi.Float(0.0)
 
-            # if enabled, update the Q-values based on the previous action 
-            # and the observed radiance (Direct + NEE + Indirect)
-            if self.update_q and self.enable_guiding and dr.any(has_prev):
-                active_up = has_prev & si.is_valid()
+            # Next Event Estimation (NEE)
+            if self.next_event_estimation:
+                # sampler_emitter_direction already mask inactive lanes, so it is ok -- and much faster -- to not check agains dr.any(active)
+                emitter_sample, emitter_weight = scene.sample_emitter_direction(si, sampler.next_2d(active), True, active=active)
+                active_nee = active & (mi.luminance(emitter_weight) > 0)
+                wo_nee = si.to_local(emitter_sample.d)
+                shadow_ray = si.spawn_ray_to(emitter_sample.p)
+                # same here: active_nee already masks
+                occluded = scene.ray_test(shadow_ray, active_nee)
+                bsdf_pdf_at_em = bsdf.pdf(ctx, si, wo_nee, active_nee)
+                if self.enable_guiding:
+                    pdf_rl_at_em = self.volume.pdf_direction(curr_idx, si.sh_frame.n, emitter_sample.d)
+                    pt_pdf_at_em = alpha * pdf_rl_at_em + (1.0 - alpha) * bsdf_pdf_at_em
+                else:
+                    pt_pdf_at_em = bsdf_pdf_at_em
+                pt_pdf_at_em = dr.select(emitter_sample.delta, 0.0, pt_pdf_at_em)
+                w_nee = mis_weight(emitter_sample.pdf, pt_pdf_at_em)
+                # bsdf.eval already includes the cosine term
+                nee_contrib_val = dr.select(active_nee & ~occluded,
+                                            emitter_weight * bsdf.eval(ctx, si, wo_nee, active_nee),
+                                            0.0)
+                result += throughput * w_nee * nee_contrib_val
+
+            # update the Q-values based on the previous action 
+            if self.update_q and self.enable_guiding:
+                # on the first bounce, has_prev is all False, propagated to volume.update through active_up
+                active_up = has_prev & si.is_valid() & prev_valid & curr_valid
                 emitter = si.emitter(scene, active_up)
                 L_dir = dr.select(emitter != None, emitter.eval(si, active_up), 0.0)
                 L_ind = dr.select(emitter == None, bsdf.eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx), 0.0)
                 # Le reward est la radiance sortante de si (émise + réfléchie)
-                self.volume.update(prev_idx, prev_dir, L_dir + nee_contrib_val + L_ind, active_up)
+                self.volume.update(prev_idx, prev_frame_n, prev_dir, L_dir + L_ind, active_up)
 
             emitter_hit = si.emitter(scene, active)
-            if dr.any(active & (emitter_hit != None)): result += throughput * emitter_hit.eval(si, active)
-        
-            if not dr.any(active): break
+            active_em_hit = active & (emitter_hit != None)
+            ds = mi.DirectionSample3f(scene, si=si, ref=prev_si)
+            em_pdf = scene.pdf_emitter_direction(prev_si, ds, active_em_hit & ~prev_delta)
+            w_bsdf = mis_weight(prev_pdf, em_pdf)
+
+            result += dr.select(active_em_hit,
+                                throughput * w_bsdf * emitter_hit.eval(si, active),
+                                mi.Spectrum(0.0)
+                                )
 
             # --- Guided Sampling with Robust MIS ---
             if self.enable_guiding:
-                # Probabilité de guidage (alpha)
-                # On vérifie l'alignement des normales pour éviter le guidage "à travers" les murs
-                dot_n = dr.dot(si.n, dr.gather(mi.Vector3f, self.volume.normals, curr_idx))
-                alpha = dr.select((dot_n > 0.5) & (self.volume.get_total_visits(curr_idx) > 50), 0.4, 0.0)
-                
                 # Tirage de la direction (RL ou BSDF)
-                wo_rl, _ = self.volume.sample_direction(curr_idx, sampler.next_2d(active))
+                wo_rl, _ = self.volume.sample_direction(curr_idx, si.sh_frame.n, sampler.next_2d(active))
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
                 
                 direction = dr.select(sampler.next_1d(active) < alpha, wo_rl, si.to_world(bs_s.wo))
@@ -360,19 +432,31 @@ class RLIntegrator(mi.SamplingIntegrator):
                 # Calcul du PDF combiné (MIS)
                 # Important : le PDF de la BSDF doit être évalué sur la direction finale
                 pdf_bsdf = bsdf.pdf(ctx, si, wo_local, active)
-                pdf_rl = self.volume.pdf_direction(curr_idx, direction)
+                pdf_rl = self.volume.pdf_direction(curr_idx, si.sh_frame.n, direction)
                 pdf_mix = alpha * pdf_rl + (1.0 - alpha) * pdf_bsdf
                 
-                # Mise à jour du throughput (f * cos / pdf_mix)
-                weight = dr.select(pdf_mix > 1e-7, (bsdf.eval(ctx, si, wo_local, active) * dr.maximum(0.0, wo_local.z)) / pdf_mix, 0.0)
+                # throughput update (f * cos / pdf_mix) -- cosine term already included
+                weight = dr.select(pdf_mix > 1e-7, bsdf.eval(ctx, si, wo_local, active) / pdf_mix, 0.0)
                 throughput *= dr.select(alpha > 0, weight, bs_w)
-                
+
                 prev_idx, prev_dir, has_prev = curr_idx, direction, active & (dr.any(throughput > 0.0))
+                bsdf_delta = mi.has_flag(bs_s.sampled_type, mi.BSDFFlags.Delta)
+                prev_pdf = dr.select(alpha > 0, pdf_mix, bs_s.pdf)
+                prev_delta = dr.select(alpha > 0, mi.Bool(False), bsdf_delta)
+                prev_si = si
+                prev_frame_n = si.sh_frame.n
+                prev_valid = curr_valid
             else:
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
                 direction, throughput, has_prev = si.to_world(bs_s.wo), throughput * bs_w, dr.full(mi.Bool, False, dr.width(active))
+                prev_pdf = bs_s.pdf
+                prev_delta = mi.has_flag(bs_s.sampled_type, mi.BSDFFlags.Delta)
+                prev_frame_n = si.sh_frame.n
+                prev_si = si
+                prev_valid = curr_valid
 
-            ray, active, depth = si.spawn_ray(direction), active & dr.any(throughput != 0.0), depth + 1
+            ray = si.spawn_ray(direction)
+            active = active & (mi.luminance(throughput) > 0.0)
         return result, active, []
     
     def save_hemi_q_values(self, path):

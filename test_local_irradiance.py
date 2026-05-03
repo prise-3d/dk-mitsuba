@@ -47,13 +47,13 @@ def test_update_and_query_averaging():
     active = mi.Bool([True])
     
     # first update
-    vol.update(idx, direction, mi.Color3f(10.0), active)
+    vol.update(idx, mi.Vector3f(0, 0, 1), direction, mi.Color3f(10.0), active)
     q_data = vol.get_q_data(idx)
     # For normal direction (0,0,1) and 2x2 resolution, flat_idx calculation results in bin 2
     assert dr.allclose(q_data[2], 10.0)
-    
+
     # second update (same bin)
-    vol.update(idx, direction, mi.Color3f(20.0), active)
+    vol.update(idx, mi.Vector3f(0, 0, 1), direction, mi.Color3f(20.0), active)
     q_data = vol.get_q_data(idx)
     assert dr.allclose(q_data[2], 15.0) # (10 + 20) / 2
 
@@ -69,7 +69,7 @@ def test_directional_bins():
     dir_side = mi.Vector3f([1, 0, 0])
     active = mi.Bool([True])
     
-    vol.update(idx, dir_up, mi.Color3f(100.0), active)
+    vol.update(idx, mi.Vector3f(0, 0, 1), dir_up, mi.Color3f(100.0), active)
     
     q_data = vol.get_q_data(idx)
     # 4x4 bins: dir_up (0,0,1) maps to bin 12, dir_side (1,0,0) maps to bin 0
@@ -94,7 +94,7 @@ def test_nearest_point():
     query_point = (np.random.rand(3).astype(np.float32) * 2.0 - 1.0)
     
     # Compute via Dr.Jit
-    found_idx = vol.nearest_point(mi.Point3f(query_point), mi.Vector3f(0, 0, 1))
+    found_idx, _ = vol.nearest_point(mi.Point3f(query_point), mi.Vector3f(0, 0, 1))
     
     # Calculate via Numpy (truth)
     dists = np.linalg.norm(pos_np - query_point, axis=1)
@@ -121,7 +121,7 @@ def test_nearest_point_exact():
     
     # Requête sur le point à [1, 1, 0] (index 3)
     query_point = mi.Point3f(1.0, 1.0, 0.0)
-    found_idx = vol.nearest_point(query_point, mi.Vector3f(0, 0, 1))
+    found_idx, _ = vol.nearest_point(query_point, mi.Vector3f(0, 0, 1))
     
     assert int(found_idx[0]) == 3
 
@@ -148,7 +148,7 @@ def test_save_function():
     vol = SurfaceIrradianceVolume.from_scene(scene, 100)
     
     # Sauvegarder dans un fichier temporaire
-    output_path = 'test_surface_points.ply'
+    output_path = 'ply/test_surface_points.ply'
     vol.save(output_path)
     
 
@@ -156,7 +156,7 @@ def test_save_function():
     with open(output_path, 'r') as f:
         assert f.readline().strip() == "ply"
 
-    output_path_hemisphere = 'hemisphere_points.ply'
+    output_path_hemisphere = 'ply/hemisphere_points.ply'
     vol.save_hemi(output_path_hemisphere)
         
 

@@ -15,7 +15,7 @@ def calculate_mse(img1, img2):
 
 @pytest.fixture
 def scene():
-    scene_path = 'scenes/cbox/cbox.xml'
+    scene_path = 'scenes/corridor.xml'
     if not os.path.exists(scene_path):
         pytest.skip("Scene file not found")
     scene = mi.load_file(scene_path)
@@ -34,6 +34,10 @@ def test_learning_improvement(scene):
     Verifies if RL guiding reduces the error compared to classic Path Tracing.
     MSE(Guided, Ref) < MSE(NoGuiding, Ref)
     """
+
+    # Create output directory for PLY files
+    os.makedirs('ply', exist_ok=True)   
+
     # Récupérer la liste des formes de la scène
     shapes = scene.shapes()
 
@@ -41,7 +45,7 @@ def test_learning_improvement(scene):
     for i, shape in enumerate(shapes):
         # On vérifie si la shape a des données de maillage (vertices/faces)
         if isinstance(shape, mi.Mesh):
-            filename = f"shape_{i}_{shape.id()}.ply"
+            filename = f"ply/shape_{i}_{shape.id()}.ply"
             shape.write_ply(filename)
             print(f"Sauvegardé : {filename}")
         else:
@@ -90,7 +94,7 @@ def test_learning_improvement(scene):
     img_guided = mi.render(scene, integrator=integrator_guided, spp=spp_test, seed=1)
     guided_time = time.perf_counter() - start_time
 
-    integrator_guided.save_hemi_q_values('learned_q_values.ply')    
+    integrator_guided.save_hemi_q_values('ply/learned_q_values.ply')    
     
     mse_no_guiding = calculate_mse(img_no_guiding, img_ref)
     mse_guided = calculate_mse(img_guided, img_ref)
@@ -110,9 +114,9 @@ def test_learning_improvement(scene):
     print(f"Improvement: {improvement:.2f}%")
 
     # save images for visual inspection (not required for the test, but useful for debugging)
-    mi.util.convert_to_bitmap(img_ref).write('test_ref.png')
-    mi.util.convert_to_bitmap(img_no_guiding).write('test_no_guiding.png')
-    mi.util.convert_to_bitmap(img_guided).write('test_guided.png')
+    mi.util.convert_to_bitmap(img_ref).write('test/test_ref.png')
+    mi.util.convert_to_bitmap(img_no_guiding).write('test/test_no_guiding.png')
+    mi.util.convert_to_bitmap(img_guided).write('test/test_guided.png')
 
     
     
