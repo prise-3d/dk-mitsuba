@@ -15,8 +15,7 @@ def calculate_mse(img1, img2):
 
 @pytest.fixture
 def scene():
-    #scene_path = 'scenes/cbox/cbox.xml'
-    scene_path = 'scenes/corridor/corridor.xml'
+    scene_path = 'scenes/corridor/corridor_4.2.xml'
     if not os.path.exists(scene_path):
         pytest.skip("Scene file not found")
     scene = mi.load_file(scene_path)
@@ -35,6 +34,10 @@ def test_learning_improvement(scene):
     Verifies if RL guiding reduces the error compared to classic Path Tracing.
     MSE(Guided, Ref) < MSE(NoGuiding, Ref)
     """
+
+    # Create output directory for PLY files
+    os.makedirs('ply', exist_ok=True)   
+
     # Récupérer la liste des formes de la scène
     shapes = scene.shapes()
 
@@ -42,7 +45,7 @@ def test_learning_improvement(scene):
     for i, shape in enumerate(shapes):
         # On vérifie si la shape a des données de maillage (vertices/faces)
         if isinstance(shape, mi.Mesh):
-            filename = f"shape_{i}_{shape.id()}.ply"
+            filename = f"ply/shape_{i}_{shape.id()}.ply"
             shape.write_ply(filename)
             print(f"Sauvegardé : {filename}")
         else:
