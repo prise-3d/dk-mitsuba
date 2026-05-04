@@ -36,7 +36,8 @@ def test_learning_improvement(scene):
     """
 
     # Create output directory for PLY files
-    os.makedirs('ply', exist_ok=True)   
+    os.makedirs('ply', exist_ok=True)
+    os.makedirs('test', exist_ok=True)
 
     # Récupérer la liste des formes de la scène
     shapes = scene.shapes()
@@ -45,7 +46,8 @@ def test_learning_improvement(scene):
     for i, shape in enumerate(shapes):
         # On vérifie si la shape a des données de maillage (vertices/faces)
         if isinstance(shape, mi.Mesh):
-            filename = f"ply/shape_{i}_{shape.id()}.ply"
+            s_id = shape.id() if shape.id() else "unnamed"
+            filename = f"ply/shape_{i}_{s_id}.ply"
             shape.write_ply(filename)
             print(f"Sauvegardé : {filename}")
         else:
@@ -61,6 +63,8 @@ def test_learning_improvement(scene):
     start_time = time.perf_counter()
     img_ref = mi.render(scene, integrator=ref_integrator, spp=256, seed=0)
     ref_time = time.perf_counter() - start_time
+    mi.util.convert_to_bitmap(img_ref).write('test/test_ref.png')
+    print("Reference saved to test/test_ref.png")
     
     # No Guiding - budget spp_test
     print(f"Rendering No Guiding ({spp_test} spp)...")
@@ -71,6 +75,8 @@ def test_learning_improvement(scene):
     start_time = time.perf_counter()
     img_no_guiding = mi.render(scene, integrator=integrator_no_guiding, spp=spp_test, seed=1)
     no_guiding_time = time.perf_counter() - start_time
+    mi.util.convert_to_bitmap(img_no_guiding).write('test/test_no_guiding.png')
+    print(f"No Guiding saved to test/test_no_guiding.png")
     
     # Guided RL - same spp_test budget, but with guiding enabled
     print(f"Training and Rendering Guided RL ({spp_test} spp)...")
@@ -93,6 +99,8 @@ def test_learning_improvement(scene):
     start_time = time.perf_counter()
     img_guided = mi.render(scene, integrator=integrator_guided, spp=spp_test, seed=1)
     guided_time = time.perf_counter() - start_time
+    mi.util.convert_to_bitmap(img_guided).write('test/test_guided.png')
+    print(f"Guided RL saved to test/test_guided.png")
 
     integrator_guided.save_hemi_q_values('ply/learned_q_values.ply')    
     
@@ -113,13 +121,6 @@ def test_learning_improvement(scene):
     improvement = (mse_no_guiding - mse_guided) / mse_no_guiding * 100
     print(f"Improvement: {improvement:.2f}%")
 
-    # save images for visual inspection (not required for the test, but useful for debugging)
-    mi.util.convert_to_bitmap(img_ref).write('test/test_ref.png')
-    mi.util.convert_to_bitmap(img_no_guiding).write('test/test_no_guiding.png')
-    mi.util.convert_to_bitmap(img_guided).write('test/test_guided.png')
-
-    
-    
     assert mse_guided < mse_no_guiding
 
 if __name__ == "__main__":
