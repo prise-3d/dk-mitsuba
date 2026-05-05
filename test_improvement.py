@@ -13,9 +13,9 @@ from local_irradiance import RLIntegrator
 def calculate_mse(img1, img2):
     return np.mean((np.array(img1) - np.array(img2))**2)
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def scene():
-    scene_path = 'scenes/corridor.xml'
+    scene_path = 'scenes/corridor/corridor_4.2.xml'
     if not os.path.exists(scene_path):
         pytest.skip("Scene file not found")
     scene = mi.load_file(scene_path)
@@ -29,10 +29,11 @@ def scene():
             break
     return scene
 
-def test_learning_improvement(scene):
+@pytest.fixture(scope="module")
+def rendering_results(scene):
     """
-    Verifies if RL guiding reduces the error compared to classic Path Tracing.
-    MSE(Guided, Ref) < MSE(NoGuiding, Ref)
+    Common setup that performs all renders and calculates MSE values.
+    Scope is 'module' to avoid re-rendering for each test method.
     """
 
     # Create output directory for PLY files
@@ -91,7 +92,7 @@ def test_learning_improvement(scene):
     
     # Training passes (some passes to fill Q-values)
     start_time = time.perf_counter()
-    for i in range(5):
+    for i in range(16):  # 16 passes with 4 spp each = 64 spp total for training
         mi.render(scene, integrator=integrator_guided, spp=4, seed=i+10)
     training_time = time.perf_counter() - start_time
     
@@ -106,6 +107,15 @@ def test_learning_improvement(scene):
     
     mse_no_guiding = calculate_mse(img_no_guiding, img_ref)
     mse_guided = calculate_mse(img_guided, img_ref)
+
+    # compare guidied and no guided to a black image 
+    mse_no_guiding_black = calculate_mse(img_no_guiding, np.zeros_like(img_no_guiding))
+    mse_guiding_black = calculate_mse(img_guided, np.zeros_like(img_guided))
+
+    # compare guided and no guided to a white image
+    mse_no_guiding_white = calculate_mse(img_no_guiding, np.ones_like(img_no_guiding))
+    mse_guiding_white = calculate_mse(img_guided, np.ones_like(img_guided))
+
     
     print(f"\n--- Performance Summary ---")
     print(f"Reference Time (256 spp): {ref_time:7.2f}s")
@@ -115,13 +125,44 @@ def test_learning_improvement(scene):
     print(f"Overhead Ratio (Guided/None): {guided_time / no_guiding_time:7.2f}x")
 
     print(f"\n--- Quality Summary ---")
-    print(f"MSE No Guiding: {mse_no_guiding:.6f}")
-    print(f"MSE Guided RL:  {mse_guided:.6f}")
+    print(f"MSE No Guiding (to ref): {mse_no_guiding:.6f}")
+    print(f"MSE Guided RL (to ref):  {mse_guided:.6f}")
+
+    print(f"MSE No Guiding (to black): {mse_no_guiding_black:.6f}")
+    print(f"MSE Guided RL (to black):  {mse_guiding_black:.6f}")
     
+    print(f"MSE No Guiding (to white): {mse_no_guiding_white:.6f}")
+    print(f"MSE Guided RL (to white):  {mse_guiding_white:.6f}")
+
     improvement = (mse_no_guiding - mse_guided) / mse_no_guiding * 100
     print(f"Improvement: {improvement:.2f}%")
 
-    assert mse_guided < mse_no_guiding
+    improvement_black = (mse_no_guiding_black - mse_guiding_black) / mse_no_guiding_black * 100
+    print(f"Improvement vs Black: {improvement_black:.2f}%")
+
+    improvement_white = (mse_no_guiding_white - mse_guiding_white) / mse_no_guiding_white * 100
+    print(f"Improvement vs White: {improvement_white:.2f}%")
+
+    
+    return {
+        "mse_no_guiding": mse_no_guiding,
+        "mse_guided": mse_guided,
+        "mse_no_guiding_black": mse_no_guiding_black,
+        "mse_guiding_black": mse_guiding_black,
+        "mse_no_guiding_white": mse_no_guiding_white,
+        "mse_guiding_white": mse_guiding_white
+    }
+
+
+def test_improvement_vs_black(rendering_results):
+    assert rendering_results["mse_no_guiding_black"] > rendering_results["mse_guiding_black"], "Guided RL should have lower MSE to black than No Guiding"
+
+def test_improvement_vs_white(rendering_results):
+    assert rendering_results["mse_no_guiding_white"] > rendering_results["mse_guiding_white"], "Guided RL should have lower MSE to white than No Guiding"
+
+def test_improvement_vs_reference(rendering_results):
+    assert rendering_results["mse_guided"] < rendering_results["mse_no_guiding"], "Guided RL should have lower MSE than No Guiding"
+
 
 if __name__ == "__main__":
     pytest.main([__file__])
