@@ -75,7 +75,7 @@
 
 	<emitter type="point" id="elm__1" name="elm__1">
 		<point name="position" x="4.076245307922363" y="5.903861999511719" z="-1.0054539442062378"/>
-		<rgb value="79.577469 79.577469 79.577469" name="intensity"/>
+		<rgb value="9.0 9.0 9.0" name="intensity"/>
 	</emitter>
 	<shape type="rectangle" id="elm__3" name="elm__3">
 		<boolean name="flip_normals" value="true"/>
