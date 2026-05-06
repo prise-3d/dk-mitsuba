@@ -173,14 +173,16 @@ class SurfaceIrradianceVolume:
         local_dir = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
         return mi.Frame3f(frame_n).to_world(local_dir)
 
-    def sample_direction(self, spatial_indices, frame_n, sample):
+    def sample_direction(self, spatial_indices, frame_n, sample, weights=None):
         """Samples a direction based on the learned Q-values and returns the corresponding PDF.
         Input: - spatial_indices: The indices of the surface points for which to sample directions.
                - sample: A 2D sample (sample.x, sample.y) in the range [0, 1] used for sampling the bin and the local offset.
+               - weights: Optional precomputed bin weights for spatial_indices. If None, recomputed.
         Output: - direction: The sampled world-space direction vector.
                 - pdf: The probability density function value for the sampled direction.
         """
-        weights = self._compute_weights(spatial_indices)
+        if weights is None:
+            weights = self._compute_weights(spatial_indices)
         bin_idx, u_l = self._sample_bin_discrete(weights, sample.x)
         direction = self._map_to_world_direction(spatial_indices, frame_n, bin_idx, u_l, sample.y)
 
@@ -188,12 +190,14 @@ class SurfaceIrradianceVolume:
         for i in range(self.n_bins_per_point): pdf = dr.select(bin_idx == i, weights[i], pdf)
         return direction, pdf * (self.n_bins_per_point / (2 * dr.pi))
 
-    def pdf_direction(self, spatial_indices, frame_n, directions):
+    def pdf_direction(self, spatial_indices, frame_n, directions, weights=None):
         """Computes the PDF for given directions based on the learned Q-values.
         Input: - spatial_indices: The indices of the surface points for which to compute the PDF.
                - directions: The world-space direction vectors for which to compute the PDF.
+               - weights: Optional precomputed bin weights for spatial_indices. If None, recomputed.
         Output: - pdf: The probability density function values for the given directions."""
-        weights = self._compute_weights(spatial_indices)
+        if weights is None:
+            weights = self._compute_weights(spatial_indices)
 
         # Determine which bin the given directions fall into
         w_l = mi.Frame3f(frame_n).to_local(directions)
@@ -368,13 +372,16 @@ class RLIntegrator(mi.SamplingIntegrator):
             ctx = mi.BSDFContext()
 
             # Optimisation : on cherche l'index de la sonde UNE SEULE FOIS par intersection
+            # et on précalcule les poids RL pour les réutiliser dans NEE/sample/MIS-PDF
             if self.enable_guiding:
                 curr_idx, curr_valid = self.volume.nearest_point(si.p, si.sh_frame.n)
                 alpha = dr.select(curr_valid & (self.volume.get_total_visits(curr_idx) > 50), 1.0, 0.0)
+                rl_weights = self.volume._compute_weights(curr_idx)
             else:
                 curr_idx = dr.zeros(mi.UInt32, dr.width(active))
                 curr_valid = mi.Bool(False)
                 alpha = mi.Float(0.0)
+                rl_weights = None
 
             # Next Event Estimation (NEE)
             if self.next_event_estimation:
@@ -387,7 +394,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                 occluded = scene.ray_test(shadow_ray, active_nee)
                 bsdf_pdf_at_em = bsdf.pdf(ctx, si, wo_nee, active_nee)
                 if self.enable_guiding:
-                    pdf_rl_at_em = self.volume.pdf_direction(curr_idx, si.sh_frame.n, emitter_sample.d)
+                    pdf_rl_at_em = self.volume.pdf_direction(curr_idx, si.sh_frame.n, emitter_sample.d, weights=rl_weights)
                     pt_pdf_at_em = alpha * pdf_rl_at_em + (1.0 - alpha) * bsdf_pdf_at_em
                 else:
                     pt_pdf_at_em = bsdf_pdf_at_em
@@ -423,16 +430,16 @@ class RLIntegrator(mi.SamplingIntegrator):
             # --- Guided Sampling with Robust MIS ---
             if self.enable_guiding:
                 # Tirage de la direction (RL ou BSDF)
-                wo_rl, _ = self.volume.sample_direction(curr_idx, si.sh_frame.n, sampler.next_2d(active))
+                wo_rl, _ = self.volume.sample_direction(curr_idx, si.sh_frame.n, sampler.next_2d(active), weights=rl_weights)
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
-                
+
                 direction = dr.select(sampler.next_1d(active) < alpha, wo_rl, si.to_world(bs_s.wo))
                 wo_local = si.to_local(direction)
-                
+
                 # Calcul du PDF combiné (MIS)
                 # Important : le PDF de la BSDF doit être évalué sur la direction finale
                 pdf_bsdf = bsdf.pdf(ctx, si, wo_local, active)
-                pdf_rl = self.volume.pdf_direction(curr_idx, si.sh_frame.n, direction)
+                pdf_rl = self.volume.pdf_direction(curr_idx, si.sh_frame.n, direction, weights=rl_weights)
                 pdf_mix = alpha * pdf_rl + (1.0 - alpha) * pdf_bsdf
                 
                 # throughput update (f * cos / pdf_mix) -- cosine term already included
