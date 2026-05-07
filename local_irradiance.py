@@ -38,12 +38,17 @@ class SurfaceIrradianceVolume:
         """
         shapes = [s for s in scene.shapes() if s.emitter() is None]
         n_per = max(1, n_points // len(shapes))
+        # Some shapes (e.g. flat planes) return a scalar normal from sample_position;
+        # broadcast to n_per so per-shape concat sizes line up between positions and normals.
+        def _bcast(v, n):
+            return v if dr.width(v) == n else v + dr.zeros(mi.Float, n)
         px, py, pz, nx, ny, nz = [], [], [], [], [], []
         for i, s in enumerate(shapes):
             pcg = mi.PCG32(size=n_per, initstate=i)
             ps = s.sample_position(0.0, mi.Point2f(pcg.next_float32(), pcg.next_float32()))
-            px.append(ps.p.x); py.append(ps.p.y); pz.append(ps.p.z); nx.append(ps.n.x); ny.append(ps.n.y); nz.append(ps.n.z)
-        
+            px.append(_bcast(ps.p.x, n_per)); py.append(_bcast(ps.p.y, n_per)); pz.append(_bcast(ps.p.z, n_per))
+            nx.append(_bcast(ps.n.x, n_per)); ny.append(_bcast(ps.n.y, n_per)); nz.append(_bcast(ps.n.z, n_per))
+
         positions = mi.Point3f(dr.concat(px), dr.concat(py), dr.concat(pz))
         normals = mi.Vector3f(dr.concat(nx), dr.concat(ny), dr.concat(nz))
         
