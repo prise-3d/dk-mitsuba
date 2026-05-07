@@ -20,7 +20,7 @@ def calculate_snr(img):
 
 @pytest.fixture(scope="module")
 def scene():
-    scene_path = 'scenes/corridor/corridor_4.2_1ponctual.xml'
+    scene_path = 'scenes/corridor/corridor_astrale/corridor_astrale_4.2.xml'
     if not os.path.exists(scene_path):
         pytest.skip("Scene file not found")
     scene = mi.load_file(scene_path)
