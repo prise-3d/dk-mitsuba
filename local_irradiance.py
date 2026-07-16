@@ -121,14 +121,27 @@ class SurfaceIrradianceVolume:
         for i, q in enumerate(all_q): res += q * self.bin_cosines[i]
         return mi.luminance(res)
 
-    def _compute_weights(self, spatial_indices, threshold=0.05):
+    def _compute_weights(self, spatial_indices, threshold=0.01, relative=True):
         """
         Computes the probability weights for each bin proportional to Q*f_s*cos
         with a positive threshold clamp on Q for ergodicity.
         Reference: Dahm & Keller (2017), Section 3.1.
+        With relative=True (default), the clamp is threshold * max_bin(Q) per
+        point: an absolute clamp either flattens the learned distribution where
+        Q is small (e.g. indirectly lit regions) or lets never-revisited bins
+        freeze at Q=0, while a relative floor scales with the local signal and
+        falls back to cosine sampling where nothing is learned yet.
+        With relative=False, threshold is the absolute clamp value.
         """
         all_q = self.get_q_data(spatial_indices)
-        q_lum = [dr.maximum(mi.luminance(q), threshold) for q in all_q]
+        lums = [mi.luminance(q) for q in all_q]
+        if relative:
+            q_max = dr.zeros(mi.Float, dr.width(spatial_indices))
+            for l in lums: q_max = dr.maximum(q_max, l)
+            eps = dr.maximum(q_max * threshold, 1e-8)
+        else:
+            eps = mi.Float(threshold)
+        q_lum = [dr.maximum(l, eps) for l in lums]
         q_cos = [q_lum[i] * self.bin_cosines[i] for i in range(self.n_bins_per_point)]
 
         q_sum = dr.zeros(mi.Float, dr.width(spatial_indices))
