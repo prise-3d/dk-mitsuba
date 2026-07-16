@@ -396,7 +396,7 @@ class RLIntegrator(mi.SamplingIntegrator):
             # et on précalcule les poids RL pour les réutiliser dans NEE/sample/MIS-PDF
             if self.enable_guiding:
                 curr_idx, curr_valid = self.volume.nearest_point(si.p, si.sh_frame.n)
-                alpha = dr.select(curr_valid & (self.volume.get_total_visits(curr_idx) > 50), 1.0, 0.0)
+                alpha = dr.select(curr_valid, 1.0, 0.0)
                 rl_weights = self.volume._compute_weights(curr_idx)
             else:
                 curr_idx = dr.zeros(mi.UInt32, dr.width(active))
