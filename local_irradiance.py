@@ -427,12 +427,17 @@ class RLIntegrator(mi.SamplingIntegrator):
             # update the Q-values based on the previous action 
             if self.update_q and self.enable_guiding:
                 # on the first bounce, has_prev is all False, propagated to volume.update through active_up
-                active_up = has_prev & si.is_valid() & prev_valid & curr_valid
+                # Emitter hits seed the Q table with L_dir and need no probe at the
+                # hit point (emitters carry no probes, so requiring curr_valid there
+                # would discard the seed rewards); only the indirect estimate, which
+                # reads Q at the hit point, requires curr_valid.
+                active_up = has_prev & si.is_valid() & prev_valid
                 emitter = si.emitter(scene, active_up)
-                L_dir = dr.select(emitter != None, emitter.eval(si, active_up), 0.0)
-                L_ind = dr.select(emitter == None, bsdf.eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx), 0.0)
+                is_em = emitter != None
+                L_dir = dr.select(is_em, emitter.eval(si, active_up), 0.0)
+                L_ind = dr.select(~is_em & curr_valid, bsdf.eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx), 0.0)
                 # Le reward est la radiance sortante de si (émise + réfléchie)
-                self.volume.update(prev_idx, prev_frame_n, prev_dir, L_dir + L_ind, active_up)
+                self.volume.update(prev_idx, prev_frame_n, prev_dir, L_dir + L_ind, active_up & (is_em | curr_valid))
 
             emitter_hit = si.emitter(scene, active)
             active_em_hit = active & (emitter_hit != None)
