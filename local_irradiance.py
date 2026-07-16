@@ -37,13 +37,16 @@ class SurfaceIrradianceVolume:
         and constructs a SurfaceIrradianceVolume for RL-guided sampling.
         """
         shapes = [s for s in scene.shapes() if s.emitter() is None]
-        n_per = max(1, n_points // len(shapes))
+        # Allocate probes proportionally to surface area (at least one per shape):
+        areas = [max(float(s.surface_area()[0]), 1e-8) for s in shapes]
+        total_area = sum(areas)
+        counts = [max(1, int(round(n_points * a / total_area))) for a in areas]
         # Some shapes (e.g. flat planes) return a scalar normal from sample_position;
         # broadcast to n_per so per-shape concat sizes line up between positions and normals.
         def _bcast(v, n):
             return v if dr.width(v) == n else v + dr.zeros(mi.Float, n)
         px, py, pz, nx, ny, nz = [], [], [], [], [], []
-        for i, s in enumerate(shapes):
+        for i, (s, n_per) in enumerate(zip(shapes, counts)):
             pcg = mi.PCG32(size=n_per, initstate=i)
             ps = s.sample_position(0.0, mi.Point2f(pcg.next_float32(), pcg.next_float32()))
             px.append(_bcast(ps.p.x, n_per)); py.append(_bcast(ps.p.y, n_per)); pz.append(_bcast(ps.p.z, n_per))
