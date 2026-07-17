@@ -80,10 +80,43 @@ def make_integrator(mode, args):
     return integ
 
 
-def save_image(img, path):
-    """Writes the image as linear float32 OpenEXR."""
-    mi.Bitmap(np.asarray(img, dtype=np.float32)).write(path)
+def save_image(img, path, metadata=None):
+    """Writes the image as linear float32 OpenEXR, with optional metadata
+    stored in the EXR header."""
+    bmp = mi.Bitmap(np.asarray(img, dtype=np.float32))
+    if metadata:
+        md = bmp.metadata()
+        for k, v in metadata.items():
+            md[k] = v
+    bmp.write(path)
     print(f"saved {path}")
+
+
+def load_cached_reference(args, size):
+    """Reloads a previously rendered reference when it matches the request:
+    same scene (checked via EXR metadata), same resolution, and at least the
+    requested spp. Returns (image, spp) or (None, 0)."""
+    path = f"{args.out_prefix}_ref.exr"
+    if args.force_ref or not os.path.exists(path):
+        return None, 0
+    bmp = mi.Bitmap(path)
+    try:
+        md = bmp.metadata()
+        scene_name, spp = str(md['scene']), int(md['spp'])
+    except Exception:
+        print(f"  {path} exists but lacks metadata, re-rendering the reference")
+        return None, 0
+    if scene_name != os.path.basename(args.scene):
+        print(f"  cached reference is for scene '{scene_name}', re-rendering")
+        return None, 0
+    if (bmp.size().x, bmp.size().y) != (size.x, size.y):
+        print(f"  cached reference resolution {bmp.size()} differs, re-rendering")
+        return None, 0
+    if spp < args.ref_spp:
+        print(f"  cached reference has only {spp} spp (< {args.ref_spp}), re-rendering")
+        return None, 0
+    print(f"  reusing cached reference {path} ({spp} spp)")
+    return np.array(bmp), spp
 
 
 def render_reference(scene, args, n_pixels):
@@ -208,6 +241,8 @@ def main():
     parser.add_argument('--ref-pass-samples', type=int, default=2**28,
                         help='max wavefront size (pixels * spp) per reference pass; '
                              'the reference is split into passes to stay under it')
+    parser.add_argument('--force-ref', action='store_true',
+                        help='re-render the reference even if a matching cached one exists')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--out-prefix', default='render',
                         help='output file prefix (e.g. render_rl, render_brdf')
@@ -217,11 +252,16 @@ def main():
     size = scene.sensors()[0].film().crop_size()
     print(f"Scene: {args.scene} ({size.x}x{size.y}, NEE {'off' if args.no_nee else 'on'})")
 
-    ref = None
+    ref, ref_spp = None, 0
     if args.ref_spp > 0:
-        print(f"Rendering path-traced reference ({args.ref_spp} spp)...")
-        ref = render_reference(scene, args, size.x * size.y)
-        save_image(ref, f"{args.out_prefix}_ref.exr")
+        ref, ref_spp = load_cached_reference(args, size)
+        if ref is None:
+            print(f"Rendering path-traced reference ({args.ref_spp} spp)...")
+            ref = render_reference(scene, args, size.x * size.y)
+            save_image(ref, f"{args.out_prefix}_ref.exr",
+                       metadata={'scene': os.path.basename(args.scene),
+                                 'spp': args.ref_spp, 'max_depth': 8})
+            ref_spp = args.ref_spp
 
     if args.mode in ('brdf', 'rl'):
         img, _ = render_single(scene, args.mode, args)
@@ -245,7 +285,7 @@ def main():
     labels = [results['brdf'][1], results['rl'][1]]
     if ref is not None:
         images.append(ref)
-        labels.append(f"Reference (path, {args.ref_spp} spp)")
+        labels.append(f"Reference (path, {ref_spp} spp)")
     side_by_side(images, labels, f"{args.out_prefix}_compare.png")
 
 
