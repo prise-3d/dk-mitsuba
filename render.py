@@ -3,16 +3,16 @@ Rendering of RL-guided and BRDF path tracing.
 
 Two usages:
 
-1. Single render, saved as PNG for visual inspection:
+1. Single render, saved as linear float32 OpenEXR for visual inspection:
         python render.py --mode rl   --spp 64
         python render.py --mode brdf --spp 64
 
 2. Equal-time comparison (--mode compare): both methods accumulate render
-    passes of samples each until the same wall-clock budget is
-    exhausted; the final image is the average of the passes. The sample count
+    passes of samples each until the same wall-clock budget is exhausted;
+    the final image is the average of the passes. The sample count
     each method reaches within the budget is reported on the figure. The RL
     integrator learns online during the timed passes, so its training cost is
-    included in its budget. A 1 spp warm-up pass (excluded from the budget)
+    included in its budget. A 1 spp warm-up pass, excluded from the budget,
     absorbs JIT compilation for both methods.
         python render.py --mode compare --budget 60
 
@@ -66,8 +66,9 @@ def make_integrator(mode, args):
     return integ
 
 
-def save_png(img, path):
-    mi.util.convert_to_bitmap(img).write(path)
+def save_image(img, path):
+    """Writes the image as linear float32 OpenEXR."""
+    mi.Bitmap(np.asarray(img, dtype=np.float32)).write(path)
     print(f"saved {path}")
 
 
@@ -145,7 +146,7 @@ def main():
                         help='if > 0, render a path-traced reference at this spp and report MSE')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--out-prefix', default='render',
-                        help='output file prefix (e.g. render_rl.png, render_compare.png)')
+                        help='output file prefix (e.g. render_rl, render_brdf')
     args = parser.parse_args()
 
     scene = load_scene(args)
@@ -157,11 +158,11 @@ def main():
         print(f"Rendering path-traced reference ({args.ref_spp} spp)...")
         ref_integ = mi.load_dict({'type': 'path', 'max_depth': 8})
         ref = np.array(mi.render(scene, integrator=ref_integ, spp=args.ref_spp, seed=987))
-        save_png(ref, f"{args.out_prefix}_ref.png")
+        save_image(ref, f"{args.out_prefix}_ref.exr")
 
     if args.mode in ('brdf', 'rl'):
         img, _ = render_single(scene, args.mode, args)
-        save_png(img, f"{args.out_prefix}_{args.mode}.png")
+        save_image(img, f"{args.out_prefix}_{args.mode}.exr")
         if ref is not None:
             print(f"MSE {mse(img, ref):.6f} | relMSE {rel_mse(img, ref):.4f}")
         return
@@ -170,7 +171,7 @@ def main():
     results = {}
     for mode in ('brdf', 'rl'):
         img, spp, elapsed = render_equal_time(scene, mode, args)
-        save_png(img, f"{args.out_prefix}_{mode}.png")
+        save_image(img, f"{args.out_prefix}_{mode}.exr")
         label = f"{mode.upper()} -- {spp} spp in {elapsed:.0f}s"
         if ref is not None:
             label += f"\nMSE {mse(img, ref):.5f} | relMSE {rel_mse(img, ref):.4f}"
