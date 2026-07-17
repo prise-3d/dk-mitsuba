@@ -152,7 +152,7 @@ class SurfaceIrradianceVolume:
         for i, q in enumerate(all_q): res += q * self.bin_cosines[i]
         return mi.luminance(res)
 
-    def _compute_weights(self, spatial_indices, threshold=0.01, relative=True):
+    def _compute_weights(self, spatial_indices, threshold=0.01, relative=True, all_q=None):
         """
         Computes the probability weights for each bin proportional to Q*f_s*cos
         with a positive threshold clamp on Q for ergodicity.
@@ -163,8 +163,10 @@ class SurfaceIrradianceVolume:
         freeze at Q=0, while a relative floor scales with the local signal and
         falls back to cosine sampling where nothing is learned yet.
         With relative=False, threshold is the absolute clamp value.
+        all_q optionally reuses Q data already gathered by the caller.
         """
-        all_q = self.get_q_data(spatial_indices)
+        if all_q is None:
+            all_q = self.get_q_data(spatial_indices)
         lums = [mi.luminance(q) for q in all_q]
         if relative:
             q_max = dr.zeros(mi.Float, dr.width(spatial_indices))
@@ -261,8 +263,10 @@ class SurfaceIrradianceVolume:
             
         return dr.select(w_l.z > 0, pdf * (self.n_bins_per_point / (2 * dr.pi)), 0.0)
 
-    def compute_radiance_estimate(self, spatial_indices):
-        all_q, res, d_omega = self.get_q_data(spatial_indices), mi.Color3f(0.0), (2 * dr.pi) / self.n_bins_per_point
+    def compute_radiance_estimate(self, spatial_indices, all_q=None):
+        if all_q is None:
+            all_q = self.get_q_data(spatial_indices)
+        res, d_omega = mi.Color3f(0.0), (2 * dr.pi) / self.n_bins_per_point
         for i, q in enumerate(all_q): res += q * self.bin_cosines[i] * d_omega
         return res / dr.pi
 
@@ -432,7 +436,9 @@ class RLIntegrator(mi.SamplingIntegrator):
                 # BSDF sampling fallback
                 can_guide = mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
                 alpha = dr.select(curr_valid & can_guide, 1.0, 0.0)
-                rl_weights = self.volume._compute_weights(curr_idx)
+                # Gather the Q data once per intersection.
+                all_q = self.volume.get_q_data(curr_idx)
+                rl_weights = self.volume._compute_weights(curr_idx, all_q=all_q)
             else:
                 curr_idx = dr.zeros(mi.UInt32, dr.width(active))
                 curr_valid = mi.Bool(False)
@@ -473,7 +479,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                 emitter = si.emitter(scene, active_up)
                 is_em = emitter != None
                 L_dir = dr.select(is_em, emitter.eval(si, active_up), 0.0)
-                L_ind = dr.select(~is_em & curr_valid, bsdf.eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx), 0.0)
+                L_ind = dr.select(~is_em & curr_valid, bsdf.eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx, all_q=all_q), 0.0)
                 # Le reward est la radiance sortante de si (émise + réfléchie)
                 self.volume.update(prev_idx, prev_frame_n, prev_dir, L_dir + L_ind, active_up & (is_em | curr_valid))
 
@@ -491,18 +497,15 @@ class RLIntegrator(mi.SamplingIntegrator):
             # --- Guided Sampling with Robust MIS ---
             if self.enable_guiding:
                 # Tirage de la direction (RL ou BSDF)
-                wo_rl, _ = self.volume.sample_direction(curr_idx, si.sh_frame.n, sampler.next_2d(active), weights=rl_weights)
+                wo_rl, pdf_rl = self.volume.sample_direction(curr_idx, si.sh_frame.n, sampler.next_2d(active), weights=rl_weights)
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
 
                 direction = dr.select(sampler.next_1d(active) < alpha, wo_rl, si.to_world(bs_s.wo))
                 wo_local = si.to_local(direction)
 
-                # Calcul du PDF combiné (MIS)
-                # Important : le PDF de la BSDF doit être évalué sur la direction finale
-                pdf_bsdf = bsdf.pdf(ctx, si, wo_local, active)
-                pdf_rl = self.volume.pdf_direction(curr_idx, si.sh_frame.n, direction, weights=rl_weights)
-                pdf_mix = alpha * pdf_rl + (1.0 - alpha) * pdf_bsdf
-                
+                # alpha is boolean, so no need to mix pdfs with it
+                pdf_mix = pdf_rl
+
                 # throughput update (f * cos / pdf_mix) -- cosine term already included
                 weight = dr.select(pdf_mix > 1e-7, bsdf.eval(ctx, si, wo_local, active) / pdf_mix, 0.0)
                 throughput *= dr.select(alpha > 0, weight, bs_w)
