@@ -121,6 +121,25 @@ def render_single(scene, mode, args):
     return np.array(img), elapsed
 
 
+def render_equal_spp(scene, mode, args):
+    """Accumulates --pass-spp passes until --spp total samples per pixel.
+    Same pass-based protocol as the equal-time mode (the RL integrator keeps
+    learning between passes); wall-clock time becomes the reported variable."""
+    integ = make_integrator(mode, args)
+    mi.render(scene, integrator=integ, spp=1, seed=12345)  # JIT warm-up
+    acc, done, n, t0 = None, 0, 0, time.perf_counter()
+    while done < args.spp:
+        spp = min(args.pass_spp, args.spp - done)
+        img = np.array(mi.render(scene, integrator=integ, spp=spp,
+                                 seed=args.seed + n))
+        acc = img * spp if acc is None else acc + img * spp
+        done += spp
+        n += 1
+    elapsed = time.perf_counter() - t0
+    print(f"[{mode}] {done} spp ({n} passes) in {elapsed:.1f}s")
+    return acc / done, done, elapsed
+
+
 def render_equal_time(scene, mode, args):
     """Accumulates --pass-spp passes until the time budget is exhausted."""
     integ = make_integrator(mode, args)
@@ -165,11 +184,14 @@ def side_by_side(images, labels, out_path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[1])
-    parser.add_argument('--mode', choices=['brdf', 'rl', 'compare'], default='compare')
+    parser.add_argument('--mode', choices=['brdf', 'rl', 'compare', 'compare-spp'], default='compare',
+                        help='compare: equal wall-clock budget per method (--budget); '
+                             'compare-spp: equal sample count per method (--spp)')
     parser.add_argument('--scene', default='scenes/cbox/cbox.xml')
     parser.add_argument('--resx', type=int, default=0, help='film width (0 = scene default)')
     parser.add_argument('--resy', type=int, default=0, help='film height (0 = scene default)')
-    parser.add_argument('--spp', type=int, default=64, help='samples per pixel (single-render modes)')
+    parser.add_argument('--spp', type=int, default=64,
+                        help='samples per pixel (single-render modes and compare-spp)')
     parser.add_argument('--budget', type=float, default=60.0,
                         help='wall-clock budget in seconds per method (compare mode)')
     parser.add_argument('--pass-spp', type=int, default=4,
@@ -208,10 +230,11 @@ def main():
             print(f"MSE {mse(img, ref):.6f} | relMSE {rel_mse(img, ref):.4f}")
         return
 
-    # compare mode: same wall-clock budget for both methods
+    # compare modes: same wall-clock budget, or same sample count, for both methods
+    render_pair = render_equal_spp if args.mode == 'compare-spp' else render_equal_time
     results = {}
     for mode in ('brdf', 'rl'):
-        img, spp, elapsed = render_equal_time(scene, mode, args)
+        img, spp, elapsed = render_pair(scene, mode, args)
         save_image(img, f"{args.out_prefix}_{mode}.exr")
         label = f"{mode.upper()} -- {spp} spp in {elapsed:.0f}s"
         if ref is not None:
