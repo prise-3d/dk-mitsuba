@@ -38,6 +38,10 @@ class SurfaceIrradianceVolume:
         self.grid_min, self.grid_max = mi.Point3f(bbox.min), mi.Point3f(bbox.max)
         self.grid_size = dr.maximum(self.grid_max - self.grid_min, 1e-4)
         self._build_grid(grid_k)
+        # Per-probe sampling CDF and radiance estimates, kept in sync with the
+        # Q data by refresh_distributions
+        self.cdf = dr.zeros(mi.Float, total_size)
+        self.refresh_distributions()
 
     @classmethod
     def from_scene(cls, scene, n_points, resolution_u=8, resolution_v=8, grid_res=32, q_init_value=1.0, q_init_weight=8.0, grid_k=4):
@@ -152,65 +156,58 @@ class SurfaceIrradianceVolume:
         for i, q in enumerate(all_q): res += q * self.bin_cosines[i]
         return mi.luminance(res)
 
-    def _compute_weights(self, spatial_indices, threshold=0.01, relative=True, all_q=None):
+    def refresh_distributions(self, threshold=0.01, relative=True):
         """
-        Computes the probability weights for each bin proportional to Q*f_s*cos
-        with a positive threshold clamp on Q for ergodicity.
-        Reference: Dahm & Keller (2017), Section 3.1.
-        With relative=True (default), the clamp is threshold * max_bin(Q) per
-        point: an absolute clamp either flattens the learned distribution where
-        Q is small (e.g. indirectly lit regions) or lets never-revisited bins
-        freeze at Q=0, while a relative floor scales with the local signal and
-        falls back to cosine sampling where nothing is learned yet.
+        Rebuilds the per-probe sampling distributions and radiance estimates
+        from the current Q data. All the O(n_bins) work happens here at probe
+        width (n_points lanes), so per-path queries in sample_direction /
+        pdf_direction / compute_radiance_estimate reduce to a few gathers.
+        The bin weights are proportional to max(Q, eps) * cos with a positive
+        clamp for ergodicity (Dahm & Keller 2017, Section 3.1).
+        With relative=True (default), eps is threshold * max_bin(Q) per probe:
+        an absolute clamp either flattens the learned distribution where Q is
+        small (e.g. indirectly lit regions) or lets never-revisited bins freeze
+        at Q=0, while a relative floor scales with the local signal and falls
+        back to cosine sampling where nothing is learned yet.
         With relative=False, threshold is the absolute clamp value.
-        all_q optionally reuses Q data already gathered by the caller.
         """
-        if all_q is None:
-            all_q = self.get_q_data(spatial_indices)
-        lums = [mi.luminance(q) for q in all_q]
+        pid = dr.arange(mi.UInt32, self.n_points)
+        d_omega = (2 * dr.pi) / self.n_bins_per_point
+        lums, rad = [], mi.Color3f(0.0)
+        for k in range(self.n_bins_per_point):
+            flat = pid * self.n_bins_per_point + k
+            count = dr.maximum(dr.gather(mi.Float, self.visit_counts, flat), 1.0)
+            q = mi.Color3f(dr.gather(mi.Float, self.sum_r, flat) / count,
+                           dr.gather(mi.Float, self.sum_g, flat) / count,
+                           dr.gather(mi.Float, self.sum_b, flat) / count)
+            rad += q * self.bin_cosines[k] * d_omega
+            lums.append(mi.luminance(q))
+        rad /= dr.pi
+        self.rad_r, self.rad_g, self.rad_b = rad.x, rad.y, rad.z
+
         if relative:
-            q_max = dr.zeros(mi.Float, dr.width(spatial_indices))
+            q_max = dr.zeros(mi.Float, self.n_points)
             for l in lums: q_max = dr.maximum(q_max, l)
             eps = dr.maximum(q_max * threshold, 1e-8)
         else:
             eps = mi.Float(threshold)
-        q_lum = [dr.maximum(l, eps) for l in lums]
-        q_cos = [q_lum[i] * self.bin_cosines[i] for i in range(self.n_bins_per_point)]
+        w = [dr.maximum(lums[k], eps) * self.bin_cosines[k] for k in range(self.n_bins_per_point)]
+        total = dr.zeros(mi.Float, self.n_points)
+        for val in w: total += val
 
-        q_sum = dr.zeros(mi.Float, dr.width(spatial_indices))
-        for val in q_cos: q_sum += val
+        cum = dr.zeros(mi.Float, self.n_points)
+        for k in range(self.n_bins_per_point):
+            cum = cum + w[k] / total
+            dr.scatter(self.cdf, cum, pid * self.n_bins_per_point + k)
 
-        weights = [q_c / q_sum for q_c in q_cos]
-        return weights
-
-    def _sample_bin_discrete(self, weights, sample_x):
-        """
-        Selects a bin index and calculates the local offset using Inverse Transform Sampling.
-        Reference: Dahm & Keller (2017), Section 3.1 - Sampling the piece-wise constant PDF.
-        """
-        cum_w, curr = [], dr.zeros(mi.Float, dr.width(sample_x))
-        for w in weights:
-            curr = curr + w
-            cum_w.append(curr)
-
-        bin_idx = dr.zeros(mi.UInt32, dr.width(sample_x))
-        for i in range(self.n_bins_per_point - 1):
-            bin_idx = dr.select(sample_x > cum_w[i], mi.UInt32(i + 1), bin_idx)
-
-        prev_c = dr.zeros(mi.Float, dr.width(sample_x))
-        for i in range(self.n_bins_per_point): prev_c = dr.select(bin_idx == i, (cum_w[i-1] if i > 0 else 0.0), prev_c)
-
-        # dr.gather(dr.concat(cum_w), bin_idx) returns concat[bin_idx[k]],                                                                                                       
-        # not cum_w[bin_idx[k]][k]. Both only coincides for width=1, which is
-        # why unit tests did not catch the problem in the first place
-        cur_c = dr.zeros(mi.Float, dr.width(sample_x))
-        for i in range(self.n_bins_per_point): cur_c = dr.select(bin_idx == i, cum_w[i], cur_c)
-
-        # Calculate relative position within the bin for continuous sampling
-        bin_width = dr.maximum(cur_c - prev_c, 1e-7)
-        u_local = dr.clip((sample_x - prev_c) / bin_width, 0.0, 1.0)
-        
-        return bin_idx, u_local
+    def _cdf_interval(self, spatial_indices, bin_idx):
+        """Returns (prev_c, cur_c), the CDF values bracketing bin_idx."""
+        base = spatial_indices * self.n_bins_per_point
+        cur_c = dr.gather(mi.Float, self.cdf, base + bin_idx)
+        prev_c = dr.select(bin_idx > 0,
+                           dr.gather(mi.Float, self.cdf, base + dr.maximum(bin_idx, 1) - 1),
+                           0.0)
+        return prev_c, cur_c
 
     def _map_to_world_direction(self, spatial_indices, frame_n, bin_idx, u_l, sample_y):
         """
@@ -224,32 +221,37 @@ class SurfaceIrradianceVolume:
         local_dir = mi.Vector3f(sin_theta * dr.cos(phi), sin_theta * dr.sin(phi), cos_theta)
         return mi.Frame3f(frame_n).to_world(local_dir)
 
-    def sample_direction(self, spatial_indices, frame_n, sample, weights=None):
+    def sample_direction(self, spatial_indices, frame_n, sample):
         """Samples a direction based on the learned Q-values and returns the corresponding PDF.
+        Inverts the per-probe CDF built by refresh_distributions with a binary
+        search: O(log n_bins) gathers per path instead of per-path weight
+        recomputation.
         Input:  - spatial_indices: The indices of the surface points for which to sample directions.
                 - sample: A 2D sample (sample.x, sample.y) in the range [0, 1] used for sampling the bin and the local offset.
-                - weights: Optional precomputed bin weights for spatial_indices. If None, recomputed.
         Output: - direction: The sampled world-space direction vector.
                 - pdf: The probability density function value for the sampled direction.
         """
-        if weights is None:
-            weights = self._compute_weights(spatial_indices)
-        bin_idx, u_l = self._sample_bin_discrete(weights, sample.x)
-        direction = self._map_to_world_direction(spatial_indices, frame_n, bin_idx, u_l, sample.y)
+        base = spatial_indices * self.n_bins_per_point
+        lo = dr.zeros(mi.UInt32, dr.width(spatial_indices))
+        hi = dr.full(mi.UInt32, self.n_bins_per_point - 1, dr.width(spatial_indices))
+        # Smallest bin whose (inclusive) CDF value reaches sample.x
+        for _ in range(max(1, (self.n_bins_per_point - 1).bit_length())):
+            mid = (lo + hi) >> 1
+            go_up = sample.x > dr.gather(mi.Float, self.cdf, base + mid)
+            lo = dr.select(go_up, mid + 1, lo)
+            hi = dr.select(go_up, hi, mid)
+        bin_idx = lo
 
-        pdf = dr.zeros(mi.Float, dr.width(spatial_indices))
-        for i in range(self.n_bins_per_point): pdf = dr.select(bin_idx == i, weights[i], pdf)
-        return direction, pdf * (self.n_bins_per_point / (2 * dr.pi))
+        prev_c, cur_c = self._cdf_interval(spatial_indices, bin_idx)
+        u_local = dr.clip((sample.x - prev_c) / dr.maximum(cur_c - prev_c, 1e-7), 0.0, 1.0)
+        direction = self._map_to_world_direction(spatial_indices, frame_n, bin_idx, u_local, sample.y)
+        return direction, (cur_c - prev_c) * (self.n_bins_per_point / (2 * dr.pi))
 
-    def pdf_direction(self, spatial_indices, frame_n, directions, weights=None):
+    def pdf_direction(self, spatial_indices, frame_n, directions):
         """Computes the PDF for given directions based on the learned Q-values.
         Input:  - spatial_indices: The indices of the surface points for which to compute the PDF.
                 - directions: The world-space direction vectors for which to compute the PDF.
-                - weights: Optional precomputed bin weights for spatial_indices. If None, recomputed.
         Output: - pdf: The probability density function values for the given directions."""
-        if weights is None:
-            weights = self._compute_weights(spatial_indices)
-
         # Determine which bin the given directions fall into
         w_l = mi.Frame3f(frame_n).to_local(directions)
         phi = dr.atan2(w_l.y, w_l.x)
@@ -257,18 +259,14 @@ class SurfaceIrradianceVolume:
         v_idx = dr.minimum(mi.UInt32(dr.clip(w_l.z, 0.0, 1.0) * self.res_v), self.res_v - 1)
         bin_idx = v_idx * self.res_u + u_idx
 
-        pdf = dr.zeros(mi.Float, dr.width(spatial_indices))
-        for i in range(self.n_bins_per_point):
-            pdf = dr.select(bin_idx == i, weights[i], pdf)
-            
-        return dr.select(w_l.z > 0, pdf * (self.n_bins_per_point / (2 * dr.pi)), 0.0)
+        prev_c, cur_c = self._cdf_interval(spatial_indices, bin_idx)
+        return dr.select(w_l.z > 0, (cur_c - prev_c) * (self.n_bins_per_point / (2 * dr.pi)), 0.0)
 
-    def compute_radiance_estimate(self, spatial_indices, all_q=None):
-        if all_q is None:
-            all_q = self.get_q_data(spatial_indices)
-        res, d_omega = mi.Color3f(0.0), (2 * dr.pi) / self.n_bins_per_point
-        for i, q in enumerate(all_q): res += q * self.bin_cosines[i] * d_omega
-        return res / dr.pi
+    def compute_radiance_estimate(self, spatial_indices):
+        """Per-probe radiance estimate, precomputed by refresh_distributions."""
+        return mi.Color3f(dr.gather(mi.Float, self.rad_r, spatial_indices),
+                          dr.gather(mi.Float, self.rad_g, spatial_indices),
+                          dr.gather(mi.Float, self.rad_b, spatial_indices))
 
     def get_total_visits(self, spatial_indices):
         total = dr.zeros(mi.Float, dr.width(spatial_indices))
@@ -436,14 +434,14 @@ class RLIntegrator(mi.SamplingIntegrator):
                 # BSDF sampling fallback
                 can_guide = mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
                 alpha = dr.select(curr_valid & can_guide, 1.0, 0.0)
-                # Gather the Q data once per intersection.
-                all_q = self.volume.get_q_data(curr_idx)
-                rl_weights = self.volume._compute_weights(curr_idx, all_q=all_q)
+                # Rebuild the per-probe distributions from the Q data updated
+                # at the previous bounce; the per-path queries below are a
+                # handful of gathers into these tables.
+                self.volume.refresh_distributions()
             else:
                 curr_idx = dr.zeros(mi.UInt32, dr.width(active))
                 curr_valid = mi.Bool(False)
                 alpha = mi.Float(0.0)
-                rl_weights = None
 
             # Next Event Estimation (NEE)
             if self.next_event_estimation:
@@ -456,7 +454,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                 occluded = scene.ray_test(shadow_ray, active_nee)
                 bsdf_pdf_at_em = bsdf.pdf(ctx, si, wo_nee, active_nee)
                 if self.enable_guiding:
-                    pdf_rl_at_em = self.volume.pdf_direction(curr_idx, si.sh_frame.n, emitter_sample.d, weights=rl_weights)
+                    pdf_rl_at_em = self.volume.pdf_direction(curr_idx, si.sh_frame.n, emitter_sample.d)
                     pt_pdf_at_em = alpha * pdf_rl_at_em + (1.0 - alpha) * bsdf_pdf_at_em
                 else:
                     pt_pdf_at_em = bsdf_pdf_at_em
@@ -479,7 +477,7 @@ class RLIntegrator(mi.SamplingIntegrator):
                 emitter = si.emitter(scene, active_up)
                 is_em = emitter != None
                 L_dir = dr.select(is_em, emitter.eval(si, active_up), 0.0)
-                L_ind = dr.select(~is_em & curr_valid, bsdf.eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx, all_q=all_q), 0.0)
+                L_ind = dr.select(~is_em & curr_valid, bsdf.eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx), 0.0)
                 # Le reward est la radiance sortante de si (émise + réfléchie)
                 self.volume.update(prev_idx, prev_frame_n, prev_dir, L_dir + L_ind, active_up & (is_em | curr_valid))
 
@@ -497,7 +495,7 @@ class RLIntegrator(mi.SamplingIntegrator):
             # --- Guided Sampling with Robust MIS ---
             if self.enable_guiding:
                 # Tirage de la direction (RL ou BSDF)
-                wo_rl, pdf_rl = self.volume.sample_direction(curr_idx, si.sh_frame.n, sampler.next_2d(active), weights=rl_weights)
+                wo_rl, pdf_rl = self.volume.sample_direction(curr_idx, si.sh_frame.n, sampler.next_2d(active))
                 bs_s, bs_w = bsdf.sample(ctx, si, sampler.next_1d(active), sampler.next_2d(active), active)
 
                 direction = dr.select(sampler.next_1d(active) < alpha, wo_rl, si.to_world(bs_s.wo))
