@@ -23,12 +23,14 @@ example:
 
 uv run render.py --mode compare \
     --scene scenes/corridor.xml \
-    --resx 480 --resy 480 \
-    --budget 60 \
+    --resx 720 --resy 720 \
+    --budget 5 \
     --pass-spp 4 \
     --no-nee \
-    --ref-spp 2048 \
-    --out-prefix corridor-cuda
+    --ref-spp 8192 \
+    --out-prefix corridor-cuda \
+    --grid-k 8 \
+    --grid-res 64
 """
 
 import argparse
