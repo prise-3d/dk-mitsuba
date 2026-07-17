@@ -21,7 +21,7 @@ An optional path-traced reference (--ref-spp N) adds MSE/relMSE figures.
 
 example:
 
-uv run render.py --mode compare \
+uuv run render.py --mode compare \
     --scene scenes/corridor.xml \
     --resx 720 --resy 720 \
     --budget 5 \
@@ -84,6 +84,31 @@ def save_image(img, path):
     """Writes the image as linear float32 OpenEXR."""
     mi.Bitmap(np.asarray(img, dtype=np.float32)).write(path)
     print(f"saved {path}")
+
+
+def render_reference(scene, args, n_pixels):
+    """Renders the path-traced reference in several passes so that the
+    wavefront (pixels * spp) fits in GPU memory. The pass size starts at
+    --ref-pass-samples / pixels and is halved whenever a pass runs out of
+    memory; passes are averaged with their spp as weight."""
+    integ = mi.load_dict({'type': 'path', 'max_depth': 8})
+    chunk = max(1, min(args.ref_spp, args.ref_pass_samples // n_pixels))
+    acc, done, n_passes = None, 0, 0
+    while done < args.ref_spp:
+        spp = min(chunk, args.ref_spp - done)
+        try:
+            img = np.array(mi.render(scene, integrator=integ, spp=spp, seed=987 + done))
+        except (RuntimeError, MemoryError):
+            if chunk == 1:
+                raise
+            chunk = max(1, chunk // 2)
+            print(f"  reference pass out of memory, retrying with {chunk} spp per pass")
+            continue
+        acc = img * spp if acc is None else acc + img * spp
+        done += spp
+        n_passes += 1
+    print(f"  reference: {done} spp in {n_passes} passes of <= {chunk} spp")
+    return acc / done
 
 
 def render_single(scene, mode, args):
@@ -158,6 +183,9 @@ def main():
                         help='disable next event estimation for both methods')
     parser.add_argument('--ref-spp', type=int, default=0,
                         help='if > 0, render a path-traced reference at this spp and report MSE')
+    parser.add_argument('--ref-pass-samples', type=int, default=2**28,
+                        help='max wavefront size (pixels * spp) per reference pass; '
+                             'the reference is split into passes to stay under it')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--out-prefix', default='render',
                         help='output file prefix (e.g. render_rl, render_brdf')
@@ -170,8 +198,7 @@ def main():
     ref = None
     if args.ref_spp > 0:
         print(f"Rendering path-traced reference ({args.ref_spp} spp)...")
-        ref_integ = mi.load_dict({'type': 'path', 'max_depth': 8})
-        ref = np.array(mi.render(scene, integrator=ref_integ, spp=args.ref_spp, seed=987))
+        ref = render_reference(scene, args, size.x * size.y)
         save_image(ref, f"{args.out_prefix}_ref.exr")
 
     if args.mode in ('brdf', 'rl'):
