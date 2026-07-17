@@ -18,6 +18,17 @@ Two usages:
 
 NEE is enabled by default (realistic renders); disable with --no-nee.
 An optional path-traced reference (--ref-spp N) adds MSE/relMSE figures.
+
+example:
+
+uv run render.py --mode compare \
+    --scene scenes/corridor.xml \
+    --resx 480 --resy 480 \
+    --budget 60 \
+    --pass-spp 4 \
+    --no-nee \
+    --ref-spp 2048 \
+    --out-prefix corridor-cuda
 """
 
 import argparse
@@ -27,7 +38,8 @@ import time
 import numpy as np
 import mitsuba as mi
 
-mi.set_variant('llvm_ad_rgb')
+mi.set_variant("cuda_ad_rgb")
+# mi.set_variant('llvm_ad_rgb')
 
 import local_irradiance  # noqa: F401 -- registers 'rl_integrator'
 
