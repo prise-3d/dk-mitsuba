@@ -92,7 +92,7 @@ def run_experiment(scene, integrator, n_frames, base_seed, label):
     return valid_counts, n_paths
 
 
-def make_figure(valid_rl, valid_brdf, n_paths, out_path):
+def make_figure(valid_rl, valid_brdf, n_paths, out_path, meta=None):
     frames = np.arange(1, len(valid_rl) + 1)
 
     # Improvement factor over the last 10% of frames (the "43.49x"
@@ -112,6 +112,8 @@ def make_figure(valid_rl, valid_brdf, n_paths, out_path):
         ax.annotate(name, (frames[-1], y[-tail:].mean()),
                     xytext=(6, 0), textcoords='offset points',
                     color=color, fontsize=10, fontweight='bold', va='center')
+    if meta:
+        ax.set_title(meta, color=COLOR_TEXT, fontsize=9)
     ax.set_xlabel('accumulated frames', color=COLOR_TEXT)
     ax.set_ylabel('valid paths per frame', color=COLOR_TEXT)
     ax.set_xlim(0, frames[-1] * 1.06)
@@ -162,13 +164,15 @@ def main():
     parser.add_argument('--nee', action='store_true',
                         help='enable next event estimation for both methods')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--metatitle', action='store_true',
+                        help='add scene name, grid size, probe and candidate counts to the figure title')
     parser.add_argument('--out', default='zero_contrib_comparison.pdf')
     args = parser.parse_args()
 
     scene = load_scene(args.scene, args.res)
     size = scene.sensors()[0].film().crop_size()
-    print(  f"Scene: {args.scene} ({size.x}x{size.y}, {args.frames} frames, "
-            f"NEE {'on' if args.nee else 'off'})")
+    print(f"Scene: {args.scene} ({size.x}x{size.y}, {args.frames} frames, "
+          f"NEE {'on' if args.nee else 'off'})")
 
     # BRDF importance sampling alone (same integrator, guiding disabled)
     print("\n== BRDF-based IS ==")
@@ -189,7 +193,20 @@ def main():
     integ_rl.next_event_estimation = args.nee
     valid_rl, _ = run_experiment(scene, integ_rl, args.frames, args.seed, 'RL')
 
-    ratio = make_figure(valid_rl, valid_brdf, n_paths, args.out)
+    np.savez(args.out.rsplit('.', 1)[0] + '.npz',
+             valid_rl=valid_rl, valid_brdf=valid_brdf,
+             n_paths=n_paths, frames=args.frames,
+             # run configuration, for comparing archived runs
+             scene=args.scene, res=(size.x, size.y), probes=args.probes,
+             grid_res=args.grid_res, grid_k=args.grid_k,
+             nee=args.nee, seed=args.seed)
+
+    meta = None
+    if args.metatitle:
+        import os
+        meta = (f"{os.path.basename(args.scene)} | grid {args.grid_res}^3 | "
+                f"{args.probes} probes | k={args.grid_k}")
+    ratio = make_figure(valid_rl, valid_brdf, n_paths, args.out, meta=meta)
     print(  f"\nValid paths (mean over last 10% of frames): "
             f"RL {valid_rl[-max(1, args.frames // 10):].mean():.0f} vs "
             f"BRDF {valid_brdf[-max(1, args.frames // 10):].mean():.0f} "
