@@ -44,9 +44,6 @@ class SurfaceIrradianceVolume:
         """
         shapes = [s for s in scene.shapes() if s.emitter() is None]
         # Allocate probes proportionally to surface area (at least one per shape):
-        # an equal split starves large surfaces and wastes probes on small ones,
-        # so the spatial resolution of the learned distributions becomes uniform
-        # across the scene instead of depending on how the geometry is split.
         areas = [max(float(s.surface_area()[0]), 1e-8) for s in shapes]
         total_area = sum(areas)
         counts = [max(1, int(round(n_points * a / total_area))) for a in areas]
@@ -143,8 +140,7 @@ class SurfaceIrradianceVolume:
         Q is small (e.g. indirectly lit regions) or lets never-revisited bins
         freeze at Q=0, while a relative floor scales with the local signal and
         falls back to cosine sampling where nothing is learned yet.
-        With relative=False, threshold is the absolute clamp value (previous
-        behaviour, e.g. threshold=0.05).
+        With relative=False, threshold is the absolute clamp value
         """
         all_q = self.get_q_data(spatial_indices)
         lums = [mi.luminance(q) for q in all_q]
