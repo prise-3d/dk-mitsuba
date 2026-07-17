@@ -425,11 +425,13 @@ class RLIntegrator(mi.SamplingIntegrator):
             bsdf = si.bsdf(ray)
             ctx = mi.BSDFContext()
 
-            # Optimisation : on cherche l'index de la sonde UNE SEULE FOIS par intersection
-            # et on précalcule les poids RL pour les réutiliser dans NEE/sample/MIS-PDF
+            # probe index is queried only once and weights are pre-computed
             if self.enable_guiding:
                 curr_idx, curr_valid = self.volume.nearest_point(si.p, si.sh_frame.n)
-                alpha = dr.select(curr_valid, 1.0, 0.0)
+                # Pure specular reflections support:
+                # BSDF sampling fallback
+                can_guide = mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
+                alpha = dr.select(curr_valid & can_guide, 1.0, 0.0)
                 rl_weights = self.volume._compute_weights(curr_idx)
             else:
                 curr_idx = dr.zeros(mi.UInt32, dr.width(active))
