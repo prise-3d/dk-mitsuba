@@ -10,20 +10,26 @@ class SurfaceIrradianceVolume:
     A class that maintains a volume of irradiance estimates at sampled surface points in the scene,
     discretized into directional bins, and provides methods for sampling directions based on learned Q-values.
     """
-    def __init__(self, scene, positions, normals, resolution_u=8, resolution_v=8, grid_res=32):
+    def __init__(self, scene, positions, normals, resolution_u=8, resolution_v=8, grid_res=32, q_init_value=1.0, q_init_weight=8.0):
         """
         Initializes the SurfaceIrradianceVolume with the given scene, sampled positions, normals, and discretization parameters.
-        Input: - scene: The Mitsuba scene object.
-               - positions: A list of 3D positions on the scene surfaces where irradiance will be estimated.
-               - normals: The corresponding surface normals at the sampled positions.
-               - resolution_u, resolution_v: The angular resolution for the directional discretization (number of bins in azimuth and elevation).
-               - grid_res: The resolution of the spatial grid for efficient nearest neighbor queries when finding the closest surface point for a given ray intersection.
+        Input:  - scene: The Mitsuba scene object.
+                - positions: A list of 3D positions on the scene surfaces where irradiance will be estimated.
+                - normals: The corresponding surface normals at the sampled positions.
+                - resolution_u, resolution_v: The angular resolution for the directional discretization (number of bins in azimuth and elevation).
+                - grid_res: The resolution of the spatial grid for efficient nearest neighbor queries when finding the closest surface point for a given ray intersection.
+                - q_init_value, q_init_weight: positive uniform initialization of Q
+                 (Dahm & Keller 2017, Sec. 3.1), expressed as a pseudo-count prior:
+                 each bin starts as if it had received q_init_weight visits of
+                 value q_init_value (radiance units; 0 disables the prior).
         """
         self.positions, self.normals = mi.Point3f(positions), mi.Vector3f(normals)
         self.n_points = dr.width(self.positions)
         self.res_u, self.res_v, self.n_bins_per_point = resolution_u, resolution_v, resolution_u * resolution_v
         total_size = self.n_points * self.n_bins_per_point
-        self.sum_r, self.sum_g, self.sum_b, self.visit_counts = dr.zeros(mi.Float, total_size), dr.zeros(mi.Float, total_size), dr.zeros(mi.Float, total_size), dr.zeros(mi.Float, total_size)
+        prior = q_init_value * q_init_weight
+        self.sum_r, self.sum_g, self.sum_b = dr.full(mi.Float, prior, total_size), dr.full(mi.Float, prior, total_size), dr.full(mi.Float, prior, total_size)
+        self.visit_counts = dr.full(mi.Float, q_init_weight, total_size)
         self.bin_cosines = [(mi.Float(i // resolution_u) + 0.5) / resolution_v for i in range(self.n_bins_per_point)]
         self.grid_res, bbox = grid_res, scene.bbox()
         self.grid_min, self.grid_max = mi.Point3f(bbox.min), mi.Point3f(bbox.max)
@@ -31,19 +37,22 @@ class SurfaceIrradianceVolume:
         self._build_grid()
 
     @classmethod
-    def from_scene(cls, scene, n_points, resolution_u=8, resolution_v=8, grid_res=32):
+    def from_scene(cls, scene, n_points, resolution_u=8, resolution_v=8, grid_res=32, q_init_value=1.0, q_init_weight=8.0):
         """
         Distributes a specified number of probes across the surfaces of the scene (excluding emitters) 
         and constructs a SurfaceIrradianceVolume for RL-guided sampling.
         """
         shapes = [s for s in scene.shapes() if s.emitter() is None]
-        n_per = max(1, n_points // len(shapes))
+        # Allocate probes proportionally to surface area (at least one per shape):
+        areas = [max(float(s.surface_area()[0]), 1e-8) for s in shapes]
+        total_area = sum(areas)
+        counts = [max(1, int(round(n_points * a / total_area))) for a in areas]
         # Some shapes (e.g. flat planes) return a scalar normal from sample_position;
         # broadcast to n_per so per-shape concat sizes line up between positions and normals.
         def _bcast(v, n):
             return v if dr.width(v) == n else v + dr.zeros(mi.Float, n)
         px, py, pz, nx, ny, nz = [], [], [], [], [], []
-        for i, s in enumerate(shapes):
+        for i, (s, n_per) in enumerate(zip(shapes, counts)):
             pcg = mi.PCG32(size=n_per, initstate=i)
             ps = s.sample_position(0.0, mi.Point2f(pcg.next_float32(), pcg.next_float32()))
             px.append(_bcast(ps.p.x, n_per)); py.append(_bcast(ps.p.y, n_per)); pz.append(_bcast(ps.p.z, n_per))
@@ -52,7 +61,7 @@ class SurfaceIrradianceVolume:
         positions = mi.Point3f(dr.concat(px), dr.concat(py), dr.concat(pz))
         normals = mi.Vector3f(dr.concat(nx), dr.concat(ny), dr.concat(nz))
         
-        return cls(scene, positions, normals, resolution_u, resolution_v, grid_res)
+        return cls(scene, positions, normals, resolution_u, resolution_v, grid_res, q_init_value, q_init_weight)
 
     def _build_grid(self):
         """
@@ -121,14 +130,27 @@ class SurfaceIrradianceVolume:
         for i, q in enumerate(all_q): res += q * self.bin_cosines[i]
         return mi.luminance(res)
 
-    def _compute_weights(self, spatial_indices, threshold=0.05):
+    def _compute_weights(self, spatial_indices, threshold=0.01, relative=True):
         """
         Computes the probability weights for each bin proportional to Q*f_s*cos
         with a positive threshold clamp on Q for ergodicity.
         Reference: Dahm & Keller (2017), Section 3.1.
+        With relative=True (default), the clamp is threshold * max_bin(Q) per
+        point: an absolute clamp either flattens the learned distribution where
+        Q is small (e.g. indirectly lit regions) or lets never-revisited bins
+        freeze at Q=0, while a relative floor scales with the local signal and
+        falls back to cosine sampling where nothing is learned yet.
+        With relative=False, threshold is the absolute clamp value
         """
         all_q = self.get_q_data(spatial_indices)
-        q_lum = [dr.maximum(mi.luminance(q), threshold) for q in all_q]
+        lums = [mi.luminance(q) for q in all_q]
+        if relative:
+            q_max = dr.zeros(mi.Float, dr.width(spatial_indices))
+            for l in lums: q_max = dr.maximum(q_max, l)
+            eps = dr.maximum(q_max * threshold, 1e-8)
+        else:
+            eps = mi.Float(threshold)
+        q_lum = [dr.maximum(l, eps) for l in lums]
         q_cos = [q_lum[i] * self.bin_cosines[i] for i in range(self.n_bins_per_point)]
 
         q_sum = dr.zeros(mi.Float, dr.width(spatial_indices))
@@ -340,6 +362,8 @@ class RLIntegrator(mi.SamplingIntegrator):
         self.n_probes, self.enable_guiding, self.update_q = props.get('n_probes', 1000), props.get('enable_guiding', True), props.get('update_q', True)
         self.resolution_u, self.resolution_v = props.get('resolution_u', 8), props.get('resolution_v', 8)
         self.grid_res = props.get('grid_res', 32)
+        self.q_init_value = props.get('q_init_value', 1.0)
+        self.q_init_weight = props.get('q_init_weight', 8.0)
         self.volume = None
         self.next_event_estimation = True
 
@@ -349,9 +373,10 @@ class RLIntegrator(mi.SamplingIntegrator):
         """
         if self.enable_guiding and self.volume is None:
             self.volume = SurfaceIrradianceVolume.from_scene(
-                scene, self.n_probes, 
-                self.resolution_u, self.resolution_v, 
-                self.grid_res
+                scene, self.n_probes,
+                self.resolution_u, self.resolution_v,
+                self.grid_res,
+                self.q_init_value, self.q_init_weight
             )
             
         throughput, result = mi.Spectrum(1.0), mi.Spectrum(0.0)
@@ -380,7 +405,7 @@ class RLIntegrator(mi.SamplingIntegrator):
             # et on précalcule les poids RL pour les réutiliser dans NEE/sample/MIS-PDF
             if self.enable_guiding:
                 curr_idx, curr_valid = self.volume.nearest_point(si.p, si.sh_frame.n)
-                alpha = dr.select(curr_valid & (self.volume.get_total_visits(curr_idx) > 50), 1.0, 0.0)
+                alpha = dr.select(curr_valid, 1.0, 0.0)
                 rl_weights = self.volume._compute_weights(curr_idx)
             else:
                 curr_idx = dr.zeros(mi.UInt32, dr.width(active))
@@ -411,15 +436,20 @@ class RLIntegrator(mi.SamplingIntegrator):
                                             0.0)
                 result += throughput * w_nee * nee_contrib_val
 
-            # update the Q-values based on the previous action 
+            # update the Q-values based on the previous action
             if self.update_q and self.enable_guiding:
                 # on the first bounce, has_prev is all False, propagated to volume.update through active_up
-                active_up = has_prev & si.is_valid() & prev_valid & curr_valid
+                # Emitter hits seed the Q table with L_dir and need no probe at the
+                # hit point (emitters carry no probes, so requiring curr_valid there
+                # would discard the seed rewards); only the indirect estimate, which
+                # reads Q at the hit point, requires curr_valid.
+                active_up = has_prev & si.is_valid() & prev_valid
                 emitter = si.emitter(scene, active_up)
-                L_dir = dr.select(emitter != None, emitter.eval(si, active_up), 0.0)
-                L_ind = dr.select(emitter == None, bsdf.eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx), 0.0)
+                is_em = emitter != None
+                L_dir = dr.select(is_em, emitter.eval(si, active_up), 0.0)
+                L_ind = dr.select(~is_em & curr_valid, bsdf.eval_diffuse_reflectance(si) * self.volume.compute_radiance_estimate(curr_idx), 0.0)
                 # Le reward est la radiance sortante de si (émise + réfléchie)
-                self.volume.update(prev_idx, prev_frame_n, prev_dir, L_dir + L_ind, active_up)
+                self.volume.update(prev_idx, prev_frame_n, prev_dir, L_dir + L_ind, active_up & (is_em | curr_valid))
 
             emitter_hit = si.emitter(scene, active)
             active_em_hit = active & (emitter_hit != None)

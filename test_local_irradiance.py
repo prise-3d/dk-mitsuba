@@ -24,13 +24,21 @@ def test_initialization():
     scene = mi.load_dict({'type': 'scene', 's': {'type': 'sphere'}})
 
     vol = SurfaceIrradianceVolume(scene, positions, normals, res_u, res_v, grid_res)
-    
+
     assert vol.n_points == n_points
     assert vol.res_u == res_u
     assert vol.res_v == res_v
     assert vol.n_bins_per_point == res_u * res_v
     assert dr.width(vol.sum_r) == n_points * res_u * res_v
-    assert dr.all(vol.visit_counts == 0)[0]
+    # Default: positive uniform initialization (Dahm & Keller Sec. 3.1),
+    # 8 pseudo-visits of Q=1 per bin, so all Q start at q_init_value.
+    assert dr.all(vol.visit_counts == 8.0)[0]
+    q0 = vol.get_q_data(mi.UInt32([0]))
+    assert dr.allclose(q0[0], 1.0)
+
+    # Prior disabled: table starts empty.
+    vol0 = SurfaceIrradianceVolume(scene, positions, normals, res_u, res_v, grid_res, q_init_weight=0.0)
+    assert dr.all(vol0.visit_counts == 0)[0]
 
 def test_update_and_query_averaging():
     """
@@ -40,12 +48,13 @@ def test_update_and_query_averaging():
     positions = mi.Point3f([0], [0], [0])
     normals = mi.Vector3f([0], [0], [1])
     scene = mi.load_dict({'type': 'scene', 's': {'type': 'sphere'}})
-    vol = SurfaceIrradianceVolume(scene, positions, normals, 2, 2, 16)
-    
+    # Prior disabled to check the pure running average
+    vol = SurfaceIrradianceVolume(scene, positions, normals, 2, 2, 16, q_init_weight=0.0)
+
     idx = mi.UInt32([0])
     direction = mi.Vector3f([0], [0], [1])
     active = mi.Bool([True])
-    
+
     # first update
     vol.update(idx, mi.Vector3f(0, 0, 1), direction, mi.Color3f(10.0), active)
     q_data = vol.get_q_data(idx)
@@ -57,12 +66,18 @@ def test_update_and_query_averaging():
     q_data = vol.get_q_data(idx)
     assert dr.allclose(q_data[2], 15.0) # (10 + 20) / 2
 
+    # With the default prior (8 pseudo-visits of Q=1), the prior blends into
+    # the running mean: (8*1 + 10) / 9 = 2.0
+    vol_p = SurfaceIrradianceVolume(scene, positions, normals, 2, 2, 16)
+    vol_p.update(idx, mi.Vector3f(0, 0, 1), direction, mi.Color3f(10.0), active)
+    assert dr.allclose(vol_p.get_q_data(idx)[2], 2.0)
+
 def test_directional_bins():
     """Check that different directions fall into different bins."""
     positions = mi.Point3f([0], [0], [0])
     normals = mi.Vector3f([0], [0], [1])
     scene = mi.load_dict({'type': 'scene', 's': {'type': 'sphere'}})
-    vol = SurfaceIrradianceVolume(scene, positions, normals, 4, 4)
+    vol = SurfaceIrradianceVolume(scene, positions, normals, 4, 4, q_init_weight=0.0)
     
     idx = mi.UInt32([0])
     dir_up = mi.Vector3f([0, 0, 1])
