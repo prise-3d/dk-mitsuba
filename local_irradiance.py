@@ -1,7 +1,7 @@
 import drjit as dr
 import mitsuba as mi
 import numpy as np
-from scipy.spatial import cKDTree
+from scipy.spatial import KDTree
 
 def mis_weight(pdf_a, pdf_b):
     return dr.select(pdf_a > 0, pdf_a / (pdf_a + pdf_b), 0)
@@ -11,7 +11,7 @@ class SurfaceIrradianceVolume:
     A class that maintains a volume of irradiance estimates at sampled surface points in the scene,
     discretized into directional bins, and provides methods for sampling directions based on learned Q-values.
     """
-    def __init__(self, scene, positions, normals, resolution_u=8, resolution_v=8, grid_res=32, q_init_value=1.0, q_init_weight=8.0):
+    def __init__(self, scene, positions, normals, resolution_u=8, resolution_v=8, grid_res=32, q_init_value=1.0, q_init_weight=8.0, grid_k=4):
         """
         Initializes the SurfaceIrradianceVolume with the given scene, sampled positions, normals, and discretization parameters.
         Input:  - scene: The Mitsuba scene object.
@@ -20,9 +20,11 @@ class SurfaceIrradianceVolume:
                 - resolution_u, resolution_v: The angular resolution for the directional discretization (number of bins in azimuth and elevation).
                 - grid_res: The resolution of the spatial grid for efficient nearest neighbor queries when finding the closest surface point for a given ray intersection.
                 - q_init_value, q_init_weight: positive uniform initialization of Q
-                 (Dahm & Keller 2017, Sec. 3.1), expressed as a pseudo-count prior:
-                 each bin starts as if it had received q_init_weight visits of
-                 value q_init_value (radiance units; 0 disables the prior).
+                (Dahm & Keller 2017, Sec. 3.1), expressed as a pseudo-count prior:
+                each bin starts as if it had received q_init_weight visits of
+                value q_init_value (radiance units; 0 disables the prior).
+                - grid_k: number of candidate probes stored per grid cell,
+                among which nearest_point picks the closest normal-compatible one.
         """
         self.positions, self.normals = mi.Point3f(positions), mi.Vector3f(normals)
         self.n_points = dr.width(self.positions)
@@ -35,10 +37,10 @@ class SurfaceIrradianceVolume:
         self.grid_res, bbox = grid_res, scene.bbox()
         self.grid_min, self.grid_max = mi.Point3f(bbox.min), mi.Point3f(bbox.max)
         self.grid_size = dr.maximum(self.grid_max - self.grid_min, 1e-4)
-        self._build_grid()
+        self._build_grid(grid_k)
 
     @classmethod
-    def from_scene(cls, scene, n_points, resolution_u=8, resolution_v=8, grid_res=32, q_init_value=1.0, q_init_weight=8.0):
+    def from_scene(cls, scene, n_points, resolution_u=8, resolution_v=8, grid_res=32, q_init_value=1.0, q_init_weight=8.0, grid_k=4):
         """
         Distributes a specified number of probes across the surfaces of the scene (excluding emitters) 
         and constructs a SurfaceIrradianceVolume for RL-guided sampling.
@@ -62,7 +64,7 @@ class SurfaceIrradianceVolume:
         positions = mi.Point3f(dr.concat(px), dr.concat(py), dr.concat(pz))
         normals = mi.Vector3f(dr.concat(nx), dr.concat(ny), dr.concat(nz))
         
-        return cls(scene, positions, normals, resolution_u, resolution_v, grid_res, q_init_value, q_init_weight)
+        return cls(scene, positions, normals, resolution_u, resolution_v, grid_res, q_init_value, q_init_weight, grid_k)
 
     def _build_grid(self, k=4):
         """
@@ -80,7 +82,7 @@ class SurfaceIrradianceVolume:
         zz, yy, xx = np.meshgrid(axis, axis, axis, indexing='ij')
         centers = gmin + gsize * np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()])
 
-        tree = cKDTree(np.array(self.positions).T)
+        tree = KDTree(np.array(self.positions).T)
         _, idx = tree.query(centers, k=self.grid_k, workers=-1)
         idx = idx.reshape(res**3, self.grid_k)
         self.grid_data = [mi.UInt32(idx[:, j].astype(np.uint32)) for j in range(self.grid_k)]
@@ -384,6 +386,7 @@ class RLIntegrator(mi.SamplingIntegrator):
         self.grid_res = props.get('grid_res', 32)
         self.q_init_value = props.get('q_init_value', 1.0)
         self.q_init_weight = props.get('q_init_weight', 8.0)
+        self.grid_k = props.get('grid_k', 4)
         self.volume = None
         self.next_event_estimation = True
 
@@ -396,7 +399,8 @@ class RLIntegrator(mi.SamplingIntegrator):
                 scene, self.n_probes,
                 self.resolution_u, self.resolution_v,
                 self.grid_res,
-                self.q_init_value, self.q_init_weight
+                self.q_init_value, self.q_init_weight,
+                self.grid_k
             )
             
         throughput, result = mi.Spectrum(1.0), mi.Spectrum(0.0)

@@ -8,15 +8,16 @@ number of accumulated frames, for two sampling strategies:
     - RL-based IS   : guiding by the learned Q-values (Expected Sarsa),
     - BRDF-based IS : classic importance sampling based on the BSDF alone.
 
-Just like in the paper, one path is traced per pixel per frame, and Q-values
-are learned online during rendering.
+As in the paper, one path is traced per pixel per frame, and Q-learning
+happens online during rendering: the RL curve therefore shows the learning
+progress over accumulated frames.
 
 By default, next event estimation is disabled for both methods: with NEE,
 almost every path would reach a light source through shadow rays and the
 count would become trivial. The measurement therefore evaluates, as in the
-paper, the ability of the directional sampling to reach the light. Without
+paper, the ability of the directional sampling to reach the light. (Without
 NEE the MIS weighting of this implementation underestimates radiance, but
-this does not change whether a path contribution is zero or not.
+this does not change whether a path contribution is zero or not.)
 
 Usage:
     python plot_zero_contrib.py                       # cbox, 256x256, 400 frames
@@ -34,10 +35,10 @@ import drjit as dr
 
 mi.set_variant('llvm_ad_rgb')
 
-import local_irradiance  # registers 'rl_integrator' to mitsuba
+import local_irradiance  # noqa: F401 -- registers 'rl_integrator'
 
 # Validated categorical palette (slots 1 and 2, light mode)
-COLOR_RL   = '#2a78d6'  # blue : RL-based IS
+COLOR_RL = '#2a78d6'    # blue : RL-based IS
 COLOR_BRDF = '#1baf7a'  # aqua : BRDF-based IS
 COLOR_TEXT = '#3a3a38'
 COLOR_GRID = '#e6e5e1'
@@ -85,17 +86,17 @@ def run_experiment(scene, integrator, n_frames, base_seed, label):
     for f in range(n_frames):
         valid_counts[f], n_paths = trace_frame(scene, integrator, sampler_proto, base_seed + f)
         if (f + 1) % 25 == 0 or f == n_frames - 1:
-            print(
-                f"  [{label}] frame {f + 1}/{n_frames}: "
-                f"{valid_counts[f]}/{n_paths} valid paths "
-                f"({time.perf_counter() - t0:.1f}s)")
+            print(  f"  [{label}] frame {f + 1}/{n_frames}: "
+                    f"{valid_counts[f]}/{n_paths} valid paths "
+                    f"({time.perf_counter() - t0:.1f}s)")
     return valid_counts, n_paths
 
 
 def make_figure(valid_rl, valid_brdf, n_paths, out_path):
     frames = np.arange(1, len(valid_rl) + 1)
 
-    # Improvement factor over the last 10% of frames
+    # Improvement factor over the last 10% of frames (the "43.49x"
+    # annotation of figure 8)
     tail = max(1, len(frames) // 10)
     mean_rl, mean_brdf = valid_rl[-tail:].mean(), valid_brdf[-tail:].mean()
     ratio = mean_rl / max(mean_brdf, 1e-9)
@@ -105,7 +106,8 @@ def make_figure(valid_rl, valid_brdf, n_paths, out_path):
 
     ax.plot(frames, valid_rl, color=COLOR_RL, lw=2, label='RL-based IS')
     ax.plot(frames, valid_brdf, color=COLOR_BRDF, lw=2, label='BRDF-based IS')
-    # Direct labels at the end of each curve     
+    # Direct labels at the end of each curve (both series stay identifiable
+    # without relying on color alone)
     for y, color, name in [(valid_rl, COLOR_RL, 'RL'), (valid_brdf, COLOR_BRDF, 'BRDF')]:
         ax.annotate(name, (frames[-1], y[-tail:].mean()),
                     xytext=(6, 0), textcoords='offset points',
@@ -134,10 +136,10 @@ def make_figure(valid_rl, valid_brdf, n_paths, out_path):
                 color=COLOR_TEXT, fontsize=12, fontweight='bold', va='center')
 
     handles, labels = ax.get_legend_handles_labels()
-    fig.legend(handles, labels, frameon=False, ncol=2, loc='upper center',
+    fig.legend( handles, labels, frameon=False, ncol=2, loc='upper center',
                 bbox_to_anchor=(0.5, 0.92), labelcolor=COLOR_TEXT)
-    fig.suptitle('RL-based vs BRDF-based importance sampling zero contributions paths count',
-                color=COLOR_TEXT, fontsize=12, y=0.98)
+    fig.suptitle(   'RL-based vs BRDF-based importance sampling',
+                    color=COLOR_TEXT, fontsize=12, y=0.98)
     fig.tight_layout(rect=[0, 0, 1, 0.87])
     fig.savefig(out_path, bbox_inches='tight')
     print(f"Figure saved: {out_path}")
@@ -153,6 +155,10 @@ def main():
                         help='number of accumulated frames (1000 in the paper)')
     parser.add_argument('--probes', type=int, default=4096,
                         help='number of spatial probes for learning')
+    parser.add_argument('--grid-res', type=int, default=32,
+                        help='resolution of the probe lookup grid (cells per axis)')
+    parser.add_argument('--grid-k', type=int, default=4,
+                        help='candidate probes per grid cell for the normal-aware lookup')
     parser.add_argument('--nee', action='store_true',
                         help='enable next event estimation for both methods')
     parser.add_argument('--seed', type=int, default=0)
@@ -177,6 +183,8 @@ def main():
         'enable_guiding': True,
         'update_q': True,
         'n_probes': args.probes,
+        'grid_res': args.grid_res,
+        'grid_k': args.grid_k,
     })
     integ_rl.next_event_estimation = args.nee
     valid_rl, _ = run_experiment(scene, integ_rl, args.frames, args.seed, 'RL')
