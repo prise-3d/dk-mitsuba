@@ -1,6 +1,7 @@
 import drjit as dr
 import mitsuba as mi
 import numpy as np
+from scipy.spatial import cKDTree
 
 def mis_weight(pdf_a, pdf_b):
     return dr.select(pdf_a > 0, pdf_a / (pdf_a + pdf_b), 0)
@@ -63,42 +64,61 @@ class SurfaceIrradianceVolume:
         
         return cls(scene, positions, normals, resolution_u, resolution_v, grid_res, q_init_value, q_init_weight)
 
-    def _build_grid(self):
+    def _build_grid(self, k=4):
         """
         Builds the spatial grid for efficient nearest neighbor queries.
+        A KD-tree assigns to every cell its k nearest probes (from the cell
+        center)
         """
         res = self.grid_res
-        idx = dr.arange(mi.UInt32, res**3)
-        p = self.grid_min + self.grid_size * mi.Vector3f((mi.Float(idx % res) + 0.5) / res, (mi.Float((idx // res) % res) + 0.5) / res, (mi.Float(idx // (res * res)) + 0.5) / res)
-        best_indices, min_dist2 = dr.zeros(mi.UInt32, dr.width(p)), dr.full(mi.Float, 1e30, dr.width(p))
-        for i in range(self.n_points):
-            d2 = dr.squared_norm(p - dr.gather(mi.Point3f, self.positions, i))
-            is_closer = d2 < min_dist2
-            min_dist2, best_indices = dr.select(is_closer, d2, min_dist2), dr.select(is_closer, mi.UInt32(i), best_indices)
-        self.grid_data = best_indices
+        self.grid_k = min(k, self.n_points)
+
+        axis = (np.arange(res) + 0.5) / res
+        gmin = np.array(self.grid_min).reshape(3)
+        gsize = np.array(self.grid_size).reshape(3)
+        # Cell index = ix + iy*res + iz*res^2, so x varies fastest
+        zz, yy, xx = np.meshgrid(axis, axis, axis, indexing='ij')
+        centers = gmin + gsize * np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()])
+
+        tree = cKDTree(np.array(self.positions).T)
+        _, idx = tree.query(centers, k=self.grid_k, workers=-1)
+        idx = idx.reshape(res**3, self.grid_k)
+        self.grid_data = [mi.UInt32(idx[:, j].astype(np.uint32)) for j in range(self.grid_k)]
 
     def nearest_point(self, p, n, threshold=0.5):
         """
         Finds the nearest surface point index using a spatial grid. O(1) complexity.
-        Returns (idx, valid) where valid is True iff the probe normal aligns with n.
+        Among the cell's k candidate probes, returns the one closest to p whose
+        normal aligns with n. Returns (idx, valid) where valid is True iff at
+        least one candidate probe normal aligns with n.
         """
         p_rel = (p - self.grid_min) / self.grid_size
         ix = dr.clip(mi.UInt32(p_rel.x * self.grid_res), 0, self.grid_res - 1)
         iy = dr.clip(mi.UInt32(p_rel.y * self.grid_res), 0, self.grid_res - 1)
         iz = dr.clip(mi.UInt32(p_rel.z * self.grid_res), 0, self.grid_res - 1)
         idx = ix + iy * self.grid_res + iz * (self.grid_res**2)
-        probe_idx = dr.gather(mi.UInt32, self.grid_data, idx)
-        probe_n = dr.gather(mi.Vector3f, self.normals, probe_idx)
-        valid = dr.dot(n, probe_n) > threshold
-        return probe_idx, valid
+        best_idx = dr.zeros(mi.UInt32, dr.width(idx))
+        best_d2 = dr.full(mi.Float, 1e30, dr.width(idx))
+        valid = dr.full(mi.Bool, False, dr.width(idx))
+        for j in range(self.grid_k):
+            cand = dr.gather(mi.UInt32, self.grid_data[j], idx)
+            cand_p = dr.gather(mi.Point3f, self.positions, cand)
+            cand_n = dr.gather(mi.Vector3f, self.normals, cand)
+            ok = dr.dot(n, cand_n) > threshold
+            d2 = dr.squared_norm(p - cand_p)
+            better = ok & (d2 < best_d2)
+            best_idx = dr.select(better, cand, best_idx)
+            best_d2 = dr.select(better, d2, best_d2)
+            valid = valid | ok
+        return best_idx, valid
 
     def update(self, spatial_indices, frame_n, directions, rewards, active):
         """
         Updates the Q-values for the given spatial indices, directions, and rewards based on the observed samples.
-        Input: - spatial_indices: The indices of the surface points corresponding to the samples.
-               - directions: The world-space direction vectors of the samples.
-               - rewards: The observed rewards (radiance) for the samples, as a Color3f.
-               - active: A boolean mask indicating which samples are active and should be updated.
+        Input:  - spatial_indices: The indices of the surface points corresponding to the samples.
+                - directions: The world-space direction vectors of the samples.
+                - rewards: The observed rewards (radiance) for the samples, as a Color3f.
+                - active: A boolean mask indicating which samples are active and should be updated.
         """
         w_l = mi.Frame3f(frame_n).to_local(directions)
         active = active & (w_l.z > 0)
@@ -140,7 +160,7 @@ class SurfaceIrradianceVolume:
         Q is small (e.g. indirectly lit regions) or lets never-revisited bins
         freeze at Q=0, while a relative floor scales with the local signal and
         falls back to cosine sampling where nothing is learned yet.
-        With relative=False, threshold is the absolute clamp value
+        With relative=False, threshold is the absolute clamp value.
         """
         all_q = self.get_q_data(spatial_indices)
         lums = [mi.luminance(q) for q in all_q]
@@ -202,9 +222,9 @@ class SurfaceIrradianceVolume:
 
     def sample_direction(self, spatial_indices, frame_n, sample, weights=None):
         """Samples a direction based on the learned Q-values and returns the corresponding PDF.
-        Input: - spatial_indices: The indices of the surface points for which to sample directions.
-               - sample: A 2D sample (sample.x, sample.y) in the range [0, 1] used for sampling the bin and the local offset.
-               - weights: Optional precomputed bin weights for spatial_indices. If None, recomputed.
+        Input:  - spatial_indices: The indices of the surface points for which to sample directions.
+                - sample: A 2D sample (sample.x, sample.y) in the range [0, 1] used for sampling the bin and the local offset.
+                - weights: Optional precomputed bin weights for spatial_indices. If None, recomputed.
         Output: - direction: The sampled world-space direction vector.
                 - pdf: The probability density function value for the sampled direction.
         """
@@ -219,9 +239,9 @@ class SurfaceIrradianceVolume:
 
     def pdf_direction(self, spatial_indices, frame_n, directions, weights=None):
         """Computes the PDF for given directions based on the learned Q-values.
-        Input: - spatial_indices: The indices of the surface points for which to compute the PDF.
-               - directions: The world-space direction vectors for which to compute the PDF.
-               - weights: Optional precomputed bin weights for spatial_indices. If None, recomputed.
+        Input:  - spatial_indices: The indices of the surface points for which to compute the PDF.
+                - directions: The world-space direction vectors for which to compute the PDF.
+                - weights: Optional precomputed bin weights for spatial_indices. If None, recomputed.
         Output: - pdf: The probability density function values for the given directions."""
         if weights is None:
             weights = self._compute_weights(spatial_indices)
