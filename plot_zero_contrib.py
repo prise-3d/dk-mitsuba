@@ -33,7 +33,8 @@ import matplotlib.pyplot as plt
 import mitsuba as mi
 import drjit as dr
 
-mi.set_variant('llvm_ad_rgb')
+mi.set_variant('cuda_ad_rgb')
+# mi.set_variant('llvm_ad_rgb')
 
 import local_irradiance  # noqa: F401 -- registers 'rl_integrator'
 
@@ -44,13 +45,13 @@ COLOR_TEXT = '#3a3a38'
 COLOR_GRID = '#e6e5e1'
 
 
-def load_scene(path, res):
+def load_scene(path, resx, resy):
     scene = mi.load_file(path)
-    if res:
+    if resx and resy:
         params = mi.traverse(scene)
         for key in params.keys():
             if key.endswith('.film.size'):
-                params[key] = [res, res]
+                params[key] = [resx, resy]
                 params.update()
                 break
     return scene
@@ -151,6 +152,10 @@ def make_figure(valid_rl, valid_brdf, n_paths, out_path, meta=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[1])
     parser.add_argument('--scene', default='scenes/cbox/cbox.xml')
+    parser.add_argument('--resx', type=int, default=0,
+                        help='film width; with --resy, overrides --res (e.g. 1280x720 as in the paper)')
+    parser.add_argument('--resy', type=int, default=0,
+                        help='film height; with --resx, overrides --res')
     parser.add_argument('--res', type=int, default=256,
                         help='film resolution (0 = native scene resolution)')
     parser.add_argument('--frames', type=int, default=400,
@@ -159,6 +164,14 @@ def main():
                         help='number of spatial probes for learning')
     parser.add_argument('--grid-res', type=int, default=32,
                         help='resolution of the probe lookup grid (cells per axis)')
+    parser.add_argument('--res-u', type=int, default=8,
+                        help='directional bins in azimuth per probe')
+    parser.add_argument('--res-v', type=int, default=8,
+                        help='directional bins in elevation per probe')
+    parser.add_argument('--q-init-value', type=float, default=1.0,
+                        help='positive uniform Q initialization (radiance units)')
+    parser.add_argument('--q-init-weight', type=float, default=8.0,
+                        help='pseudo-visit weight of the Q initialization per bin')
     parser.add_argument('--grid-k', type=int, default=4,
                         help='candidate probes per grid cell for the normal-aware lookup')
     parser.add_argument('--nee', action='store_true',
@@ -166,13 +179,16 @@ def main():
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--metatitle', action='store_true',
                         help='add scene name, grid size, probe and candidate counts to the figure title')
-    parser.add_argument('--out', default='zero_contrib_comparison.pdf')
+    parser.add_argument('--out', default='zero_contrib_comparison.png')
     args = parser.parse_args()
 
-    scene = load_scene(args.scene, args.res)
+    if args.resx and args.resy:
+        scene = load_scene(args.scene, args.resx, args.resy)
+    else:
+        scene = load_scene(args.scene, args.res, args.res)
     size = scene.sensors()[0].film().crop_size()
-    print(f"Scene: {args.scene} ({size.x}x{size.y}, {args.frames} frames, "
-          f"NEE {'on' if args.nee else 'off'})")
+    print(  f"Scene: {args.scene} ({size.x}x{size.y}, {args.frames} frames, "
+            f"NEE {'on' if args.nee else 'off'})")
 
     # BRDF importance sampling alone (same integrator, guiding disabled)
     print("\n== BRDF-based IS ==")
@@ -187,6 +203,10 @@ def main():
         'enable_guiding': True,
         'update_q': True,
         'n_probes': args.probes,
+        'resolution_u': args.res_u,
+        'resolution_v': args.res_v,
+        'q_init_value': args.q_init_value,
+        'q_init_weight': args.q_init_weight,
         'grid_res': args.grid_res,
         'grid_k': args.grid_k,
     })
