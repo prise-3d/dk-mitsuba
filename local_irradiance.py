@@ -34,6 +34,9 @@ class SurfaceIrradianceVolume:
         self.sum_r, self.sum_g, self.sum_b = dr.full(mi.Float, prior, total_size), dr.full(mi.Float, prior, total_size), dr.full(mi.Float, prior, total_size)
         self.visit_counts = dr.full(mi.Float, q_init_weight, total_size)
         self.bin_cosines = [(mi.Float(i // resolution_u) + 0.5) / resolution_v for i in range(self.n_bins_per_point)]
+        # Flat per-bin cosines aligned with the (probe * n_bins + bin) layout
+        cos_bins = np.array([(k // resolution_u + 0.5) / resolution_v for k in range(self.n_bins_per_point)], dtype=np.float32)
+        self._cos_flat = dr.tile(mi.Float(cos_bins), self.n_points)
         self.grid_res, bbox = grid_res, scene.bbox()
         self.grid_min, self.grid_max = mi.Point3f(bbox.min), mi.Point3f(bbox.max)
         self.grid_size = dr.maximum(self.grid_max - self.grid_min, 1e-4)
@@ -171,42 +174,35 @@ class SurfaceIrradianceVolume:
         back to cosine sampling where nothing is learned yet.
         With relative=False, threshold is the absolute clamp value.
         """
-        pid = dr.arange(mi.UInt32, self.n_points)
-        d_omega = (2 * dr.pi) / self.n_bins_per_point
-        lums, rad = [], mi.Color3f(0.0)
-        for k in range(self.n_bins_per_point):
-            flat = pid * self.n_bins_per_point + k
-            count = dr.maximum(dr.gather(mi.Float, self.visit_counts, flat), 1.0)
-            q = mi.Color3f(dr.gather(mi.Float, self.sum_r, flat) / count,
-                           dr.gather(mi.Float, self.sum_g, flat) / count,
-                           dr.gather(mi.Float, self.sum_b, flat) / count)
-            rad += q * self.bin_cosines[k] * d_omega
-            lums.append(mi.luminance(q))
-        rad /= dr.pi
-        self.rad_r, self.rad_g, self.rad_b = rad.x, rad.y, rad.z
+        B = self.n_bins_per_point
+        d_omega = (2 * dr.pi) / B
+        count = dr.maximum(self.visit_counts, 1.0)
+        q_r, q_g, q_b = self.sum_r / count, self.sum_g / count, self.sum_b / count
+        lum = mi.luminance(mi.Color3f(q_r, q_g, q_b))
+
+        # Per-probe radiance estimate (Sarsa target): one block reduction per channel
+        scale = d_omega / dr.pi
+        self.rad_r = dr.block_reduce(dr.ReduceOp.Add, q_r * self._cos_flat, B) * scale
+        self.rad_g = dr.block_reduce(dr.ReduceOp.Add, q_g * self._cos_flat, B) * scale
+        self.rad_b = dr.block_reduce(dr.ReduceOp.Add, q_b * self._cos_flat, B) * scale
 
         if relative:
-            q_max = dr.zeros(mi.Float, self.n_points)
-            for l in lums: q_max = dr.maximum(q_max, l)
-            eps = dr.maximum(q_max * threshold, 1e-8)
+            q_max = dr.block_reduce(dr.ReduceOp.Max, lum, B)
+            eps = dr.repeat(dr.maximum(q_max * threshold, 1e-8), B)
         else:
             eps = mi.Float(threshold)
-        w = [dr.maximum(lums[k], eps) * self.bin_cosines[k] for k in range(self.n_bins_per_point)]
-        total = dr.zeros(mi.Float, self.n_points)
-        for val in w: total += val
-
-        cum = dr.zeros(mi.Float, self.n_points)
-        for k in range(self.n_bins_per_point):
-            cum = cum + w[k] / total
-            dr.scatter(self.cdf, cum, pid * self.n_bins_per_point + k)
+        w = dr.maximum(lum, eps) * self._cos_flat
+        total = dr.repeat(dr.block_reduce(dr.ReduceOp.Add, w, B), B)
+        # Per-probe inclusive CDF in one segmented prefix sum
+        self.cdf = dr.block_prefix_reduce(dr.ReduceOp.Add, w / total, block_size=B, exclusive=False)
 
     def _cdf_interval(self, spatial_indices, bin_idx):
         """Returns (prev_c, cur_c), the CDF values bracketing bin_idx."""
         base = spatial_indices * self.n_bins_per_point
         cur_c = dr.gather(mi.Float, self.cdf, base + bin_idx)
         prev_c = dr.select(bin_idx > 0,
-                           dr.gather(mi.Float, self.cdf, base + dr.maximum(bin_idx, 1) - 1),
-                           0.0)
+                            dr.gather(mi.Float, self.cdf, base + dr.maximum(bin_idx, 1) - 1),
+                            0.0)
         return prev_c, cur_c
 
     def _map_to_world_direction(self, spatial_indices, frame_n, bin_idx, u_l, sample_y):
