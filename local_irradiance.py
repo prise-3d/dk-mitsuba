@@ -382,6 +382,7 @@ class RLIntegrator(mi.SamplingIntegrator):
         self.n_probes, self.enable_guiding, self.update_q = props.get('n_probes', 1000), props.get('enable_guiding', True), props.get('update_q', True)
         self.resolution_u, self.resolution_v = props.get('resolution_u', 8), props.get('resolution_v', 8)
         self.grid_res = props.get('grid_res', 32)
+        self.max_depth = props.get('max_depth', 8)
         self.q_init_value = props.get('q_init_value', 1.0)
         self.q_init_weight = props.get('q_init_weight', 8.0)
         # When to rebuild the per-probe sampling distributions from Q:
@@ -427,7 +428,7 @@ class RLIntegrator(mi.SamplingIntegrator):
         prev_frame_n = mi.Vector3f(0, 0, 1)
         prev_valid = mi.Bool(False)
 
-        for _ in range(8):
+        for _ in range(self.max_depth):
             si = scene.ray_intersect(ray, active)
             active &= si.is_valid()
             

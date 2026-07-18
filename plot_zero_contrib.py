@@ -34,7 +34,6 @@ import mitsuba as mi
 import drjit as dr
 
 mi.set_variant('cuda_ad_rgb')
-# mi.set_variant('llvm_ad_rgb')
 
 import local_irradiance  # noqa: F401 -- registers 'rl_integrator'
 
@@ -174,6 +173,9 @@ def main():
                         help='pseudo-visit weight of the Q initialization per bin')
     parser.add_argument('--refresh', choices=['frame', 'bounce'], default='frame',
                         help='rebuild guiding distributions once per frame (paper) or at every bounce')
+    parser.add_argument('--max-depth', type=int, default=8,
+                        help='path length cap (bounces) for both methods; the BRDF baseline '
+                             'scales almost linearly with it')
     parser.add_argument('--grid-k', type=int, default=4,
                         help='candidate probes per grid cell for the normal-aware lookup')
     parser.add_argument('--nee', action='store_true',
@@ -194,7 +196,8 @@ def main():
 
     # BRDF importance sampling alone (same integrator, guiding disabled)
     print("\n== BRDF-based IS ==")
-    integ_brdf = mi.load_dict({'type': 'rl_integrator', 'enable_guiding': False})
+    integ_brdf = mi.load_dict({ 'type': 'rl_integrator', 'enable_guiding': False,
+                                'max_depth': args.max_depth})
     integ_brdf.next_event_estimation = args.nee
     valid_brdf, n_paths = run_experiment(scene, integ_brdf, args.frames, args.seed, 'BRDF')
 
@@ -212,6 +215,7 @@ def main():
         'grid_res': args.grid_res,
         'grid_k': args.grid_k,
         'refresh': args.refresh,
+        'max_depth': args.max_depth,
     })
     integ_rl.next_event_estimation = args.nee
     valid_rl, _ = run_experiment(scene, integ_rl, args.frames, args.seed, 'RL')
