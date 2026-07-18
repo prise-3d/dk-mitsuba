@@ -172,6 +172,8 @@ def main():
                         help='positive uniform Q initialization (radiance units)')
     parser.add_argument('--q-init-weight', type=float, default=8.0,
                         help='pseudo-visit weight of the Q initialization per bin')
+    parser.add_argument('--refresh', choices=['frame', 'bounce'], default='frame',
+                        help='rebuild guiding distributions once per frame (paper) or at every bounce')
     parser.add_argument('--grid-k', type=int, default=4,
                         help='candidate probes per grid cell for the normal-aware lookup')
     parser.add_argument('--nee', action='store_true',
@@ -209,6 +211,7 @@ def main():
         'q_init_weight': args.q_init_weight,
         'grid_res': args.grid_res,
         'grid_k': args.grid_k,
+        'refresh': args.refresh,
     })
     integ_rl.next_event_estimation = args.nee
     valid_rl, _ = run_experiment(scene, integ_rl, args.frames, args.seed, 'RL')

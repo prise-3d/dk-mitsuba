@@ -384,6 +384,12 @@ class RLIntegrator(mi.SamplingIntegrator):
         self.grid_res = props.get('grid_res', 32)
         self.q_init_value = props.get('q_init_value', 1.0)
         self.q_init_weight = props.get('q_init_weight', 8.0)
+        # When to rebuild the per-probe sampling distributions from Q:
+        # 'frame' once per frame (Dahm & Keller Sec. 3.1), 'bounce' at every
+        # bounce (fresher distributions, higher fixed cost per frame).
+        self.refresh_mode = props.get('refresh', 'frame')
+        if self.refresh_mode not in ('frame', 'bounce'):
+            raise ValueError(f"refresh must be 'frame' or 'bounce', got '{self.refresh_mode}'")
         self.grid_k = props.get('grid_k', 4)
         self.volume = None
         self.next_event_estimation = True
@@ -401,6 +407,12 @@ class RLIntegrator(mi.SamplingIntegrator):
                 self.grid_k
             )
             
+        if self.enable_guiding and self.refresh_mode == 'frame':
+            # per-probe sampling distributions from the Q data
+            # accumulated so far, once per frame, as in Dahm & Keller
+            # Sec. 3.1 ("every accumulated frame")
+            self.volume.refresh_distributions()
+
         throughput, result = mi.Spectrum(1.0), mi.Spectrum(0.0)
 
         prev_idx, prev_dir, has_prev = dr.zeros(mi.UInt32, dr.width(active)),mi.Vector3f(0.0), dr.full(mi.Bool, False, dr.width(active))
@@ -430,10 +442,11 @@ class RLIntegrator(mi.SamplingIntegrator):
                 # BSDF sampling fallback
                 can_guide = mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
                 alpha = dr.select(curr_valid & can_guide, 1.0, 0.0)
-                # Rebuild the per-probe distributions from the Q data updated
-                # at the previous bounce; the per-path queries below are a
-                # handful of gathers into these tables.
-                self.volume.refresh_distributions()
+                if self.refresh_mode == 'bounce':
+                    # Different refreshing policy: distributions also pick up
+                    # the Q updates deposited at the previous bounce
+                    # of this frame.
+                    self.volume.refresh_distributions()
             else:
                 curr_idx = dr.zeros(mi.UInt32, dr.width(active))
                 curr_valid = mi.Bool(False)

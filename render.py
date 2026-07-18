@@ -75,6 +75,7 @@ def make_integrator(mode, args):
         'grid_k': args.grid_k,
         'q_init_value': args.q_init_value,
         'q_init_weight': args.q_init_weight,
+        'refresh': args.refresh,
     })
     integ.next_event_estimation = not args.no_nee
     return integ
@@ -234,11 +235,13 @@ def main():
     parser.add_argument('--grid-k', type=int, default=4)
     parser.add_argument('--q-init-value', type=float, default=1.0)
     parser.add_argument('--q-init-weight', type=float, default=8.0)
+    parser.add_argument('--refresh', choices=['frame', 'bounce'], default='frame',
+                        help='rebuild guiding distributions once per frame (paper) or at every bounce')
     parser.add_argument('--no-nee', action='store_true',
                         help='disable next event estimation for both methods')
     parser.add_argument('--ref-spp', type=int, default=0,
                         help='if > 0, render a path-traced reference at this spp and report MSE')
-    parser.add_argument('--ref-pass-samples', type=int, default=2**28,
+    parser.add_argument('--ref-pass-samples', type=int, default=2**23,
                         help='max wavefront size (pixels * spp) per reference pass; '
                              'the reference is split into passes to stay under it')
     parser.add_argument('--force-ref', action='store_true',
