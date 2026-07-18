@@ -493,9 +493,16 @@ class RLIntegrator(mi.SamplingIntegrator):
 
             emitter_hit = si.emitter(scene, active)
             active_em_hit = active & (emitter_hit != None)
-            ds = mi.DirectionSample3f(scene, si=si, ref=prev_si)
-            em_pdf = scene.pdf_emitter_direction(prev_si, ds, active_em_hit & ~prev_delta)
-            w_bsdf = mis_weight(prev_pdf, em_pdf)
+            if self.next_event_estimation:
+                ds = mi.DirectionSample3f(scene, si=si, ref=prev_si)
+                em_pdf = scene.pdf_emitter_direction(prev_si, ds, active_em_hit & ~prev_delta)
+                w_bsdf = mis_weight(prev_pdf, em_pdf)
+            else:
+                # Without NEE, path sampling is the only strategy that reaches
+                # emitters: MIS weights must sum to 1 over the strategies in
+                # use, so down-weighting against a non-existent emitter
+                # sampling would silently discard its energy share.
+                w_bsdf = mi.Float(1.0)
 
             result += dr.select(active_em_hit,
                                 throughput * w_bsdf * emitter_hit.eval(si, active),

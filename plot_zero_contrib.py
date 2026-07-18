@@ -15,9 +15,7 @@ progress over accumulated frames.
 By default, next event estimation is disabled for both methods: with NEE,
 almost every path would reach a light source through shadow rays and the
 count would become trivial. The measurement therefore evaluates, as in the
-paper, the ability of the directional sampling to reach the light. (Without
-NEE the MIS weighting of this implementation underestimates radiance, but
-this does not change whether a path contribution is zero or not.)
+paper, the ability of the directional sampling to reach the light.
 
 Usage:
     python plot_zero_contrib.py                       # cbox, 256x256, 400 frames
