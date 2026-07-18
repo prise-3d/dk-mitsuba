@@ -76,6 +76,7 @@ def make_integrator(mode, args):
         'q_init_value': args.q_init_value,
         'q_init_weight': args.q_init_weight,
         'refresh': args.refresh,
+        'max_depth': args.max_depth,
     })
     integ.next_event_estimation = not args.no_nee
     return integ
@@ -104,11 +105,15 @@ def load_cached_reference(args, size):
     try:
         md = bmp.metadata()
         scene_name, spp = str(md['scene']), int(md['spp'])
+        depth = int(md['max_depth'])
     except Exception:
         print(f"  {path} exists but lacks metadata, re-rendering the reference")
         return None, 0
     if scene_name != os.path.basename(args.scene):
         print(f"  cached reference is for scene '{scene_name}', re-rendering")
+        return None, 0
+    if depth != args.max_depth:
+        print(f"  cached reference has max_depth {depth} (!= {args.max_depth}), re-rendering")
         return None, 0
     if (bmp.size().x, bmp.size().y) != (size.x, size.y):
         print(f"  cached reference resolution {bmp.size()} differs, re-rendering")
@@ -125,7 +130,7 @@ def render_reference(scene, args, n_pixels):
     wavefront (pixels * spp) fits in GPU memory. The pass size starts at
     --ref-pass-samples / pixels and is halved whenever a pass runs out of
     memory; passes are averaged with their spp as weight."""
-    integ = mi.load_dict({'type': 'path', 'max_depth': 8})
+    integ = mi.load_dict({'type': 'path', 'max_depth': args.max_depth})
     chunk = max(1, min(args.ref_spp, args.ref_pass_samples // n_pixels))
     acc, done, n_passes = None, 0, 0
     while done < args.ref_spp:
@@ -237,6 +242,8 @@ def main():
     parser.add_argument('--q-init-weight', type=float, default=8.0)
     parser.add_argument('--refresh', choices=['frame', 'bounce'], default='frame',
                         help='rebuild guiding distributions once per frame (paper) or at every bounce')
+    parser.add_argument('--max-depth', type=int, default=8,
+                        help='path length cap (bounces) for both methods and the reference')
     parser.add_argument('--no-nee', action='store_true',
                         help='disable next event estimation for both methods')
     parser.add_argument('--ref-spp', type=int, default=0,
@@ -263,7 +270,7 @@ def main():
             ref = render_reference(scene, args, size.x * size.y)
             save_image(ref, f"{args.out_prefix}_ref.exr",
                        metadata={'scene': os.path.basename(args.scene),
-                                 'spp': args.ref_spp, 'max_depth': 8})
+                                 'spp': args.ref_spp, 'max_depth': args.max_depth})
             ref_spp = args.ref_spp
 
     if args.mode in ('brdf', 'rl'):

@@ -428,7 +428,7 @@ class RLIntegrator(mi.SamplingIntegrator):
         prev_frame_n = mi.Vector3f(0, 0, 1)
         prev_valid = mi.Bool(False)
 
-        for _ in range(self.max_depth):
+        for depth in range(self.max_depth):
             si = scene.ray_intersect(ray, active)
             active &= si.is_valid()
             
@@ -454,7 +454,11 @@ class RLIntegrator(mi.SamplingIntegrator):
                 alpha = mi.Float(0.0)
 
             # Next Event Estimation (NEE)
-            if self.next_event_estimation:
+            # Skipped at the last iteration: an NEE path from vertex k has
+            # k+2 segments, so this keeps every contribution within max_depth
+            # segments -- the same truncation as mitsuba's 'path' plugin at
+            # max_depth, and as our own emitter-hit contributions.
+            if self.next_event_estimation and depth + 1 < self.max_depth:
                 # sampler_emitter_direction already mask inactive lanes, so it is ok -- and much faster -- to not check agains dr.any(active)
                 emitter_sample, emitter_weight = scene.sample_emitter_direction(si, sampler.next_2d(active), True, active=active)
                 active_nee = active & (mi.luminance(emitter_weight) > 0)
